@@ -843,6 +843,8 @@ class ChessboardCalibrationApp:
             return cap
 
         device = f"/dev/video{index}"
+        # STRICT: UYVY 1280x720@60 only. No fallback — if the camera can't
+        # deliver this mode, opening fails and the caller reports it.
         pipeline = (
             f"v4l2src device={device} io-mode=2 ! "
             "video/x-raw,format=UYVY,width=1280,height=720,framerate=60/1 ! "
@@ -850,13 +852,7 @@ class ChessboardCalibrationApp:
             "videoconvert ! video/x-raw,format=BGR ! "
             "appsink drop=1 max-buffers=1 sync=false"
         )
-        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-        if not cap.isOpened():
-            # Fallback to plain V4L2 so scan/preview still works if the
-            # device doesn't support UYVY 1280x720@60.
-            cap.release()
-            cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-        return cap
+        return cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 
     def on_scan_cameras(self):
 
