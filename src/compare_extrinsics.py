@@ -86,7 +86,13 @@ parser.add_argument(
     default="comparison_result.json",
     help="Where to save metrics + points (default: comparison_result.json)",
 )
-args = parser.parse_args()
+from _argpick import parse_or_pick
+args = parse_or_pick(parser, [
+    ("left_json",                "Left intrinsic JSON",       [("JSON", "*.json")]),
+    ("right_json",               "Right intrinsic JSON",      [("JSON", "*.json")]),
+    ("original_extrinsic_json",  "Original extrinsic JSON",   [("JSON", "*.json")]),
+    ("refined_extrinsic_json",   "Refined extrinsic JSON",    [("JSON", "*.json")]),
+])
 
 OFFLINE = args.left_image is not None and args.right_image is not None
 

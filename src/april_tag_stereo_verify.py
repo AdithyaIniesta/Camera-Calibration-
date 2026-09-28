@@ -74,7 +74,16 @@ parser.add_argument(
     help="AprilTag family (default: 36h11)",
 )
 parser.add_argument("--out", default="apriltag_verify.json", help="Save path for metrics")
-args = parser.parse_args()
+from _argpick import parse_or_pick
+args = parse_or_pick(
+    parser,
+    [
+        ("left_json",      "Left intrinsic JSON",  [("JSON", "*.json")]),
+        ("right_json",     "Right intrinsic JSON", [("JSON", "*.json")]),
+        ("extrinsic_json", "Stereo extrinsic JSON (refined)", [("JSON", "*.json")]),
+    ],
+    ask_missing_options=[("tag-size", "AprilTag side length in mm (black square)")],
+)
 
 
 # ============================================================

@@ -114,7 +114,12 @@ parser.add_argument(
     default=PRIOR_RX_DEG,
     help=f"Target Rx in degrees (default: {PRIOR_RX_DEG})",
 )
-args = parser.parse_args()
+from _argpick import parse_or_pick
+args = parse_or_pick(parser, [
+    ("left_json",      "Left intrinsic JSON",     [("JSON", "*.json")]),
+    ("right_json",     "Right intrinsic JSON",    [("JSON", "*.json")]),
+    ("extrinsic_json", "Initial stereo extrinsic JSON", [("JSON", "*.json")]),
+])
 
 PRIOR_BASELINE_MM = args.baseline
 PRIOR_RX_DEG = args.rx
