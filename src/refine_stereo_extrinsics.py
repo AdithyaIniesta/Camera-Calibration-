@@ -398,8 +398,8 @@ def solve_board_pose(corners_raw, K, D):
 
 def project_left_to_right(corners_left_raw, R_lr, T_lr):
     """
-    solvePnP on left → 3D in left → transform to right → project (no distortion
-    so points land on the undistorted right image).
+    solvePnP on left → 3D in left → transform to right → project through the
+    right camera's distortion, so predicted points land on the RAW right image.
     """
     rvec, tvec = solve_board_pose(corners_left_raw, K_LEFT, D_LEFT)
     if rvec is None:
@@ -412,7 +412,7 @@ def project_left_to_right(corners_left_raw, R_lr, T_lr):
         np.zeros((3, 1)),
         np.zeros((3, 1)),
         K_RIGHT,
-        np.zeros((5, 1)),
+        D_RIGHT,
     )
     return projected.reshape(-1, 2)
 
@@ -423,25 +423,15 @@ def project_right_to_left(corners_right_raw, R_lr, T_lr):
         return None
     R_board, _ = cv2.Rodrigues(rvec)
     pts_right = (R_board @ OBJECT_POINTS.T + tvec).T
-    # X_left = R^T (X_right - T)
     pts_left = (R_lr.T @ (pts_right.T - T_lr)).T
     projected, _ = cv2.projectPoints(
         pts_left.reshape(-1, 1, 3),
         np.zeros((3, 1)),
         np.zeros((3, 1)),
         K_LEFT,
-        np.zeros((5, 1)),
+        D_LEFT,
     )
     return projected.reshape(-1, 2)
-
-
-def undistort_image(frame, K, D):
-    return cv2.undistort(frame, K, D, None, K)
-
-
-def undistort_points(points, K, D):
-    pts = np.asarray(points, dtype=np.float64).reshape(-1, 1, 2)
-    return cv2.undistortPoints(pts, K, D, P=K).reshape(-1, 2)
 
 
 # ============================================================
@@ -456,17 +446,15 @@ def reprojection_residuals(x, left_corners_raw, right_corners_raw):
 
     residuals = []
 
-    # Left → Right
+    # Raw-pixel residuals: compare predictions (with distortion applied)
+    # directly against the detected corners in raw pixels.
     pred_r = project_left_to_right(left_corners_raw, R_lr, T_lr)
     if pred_r is not None:
-        actual_r = undistort_points(right_corners_raw, K_RIGHT, D_RIGHT)
-        residuals.append((pred_r - actual_r).ravel())
+        residuals.append((pred_r - np.asarray(right_corners_raw).reshape(-1, 2)).ravel())
 
-    # Right → Left
     pred_l = project_right_to_left(right_corners_raw, R_lr, T_lr)
     if pred_l is not None:
-        actual_l = undistort_points(left_corners_raw, K_LEFT, D_LEFT)
-        residuals.append((pred_l - actual_l).ravel())
+        residuals.append((pred_l - np.asarray(left_corners_raw).reshape(-1, 2)).ravel())
 
     if not residuals:
         return np.zeros(6, dtype=np.float64)
@@ -494,12 +482,10 @@ def mean_reprojection_error(R_lr, T_lr, left_corners_raw, right_corners_raw):
     errors = []
     pred_r = project_left_to_right(left_corners_raw, R_lr, T_lr)
     if pred_r is not None:
-        actual_r = undistort_points(right_corners_raw, K_RIGHT, D_RIGHT)
-        errors.append(np.linalg.norm(pred_r - actual_r, axis=1))
+        errors.append(np.linalg.norm(pred_r - np.asarray(right_corners_raw).reshape(-1, 2), axis=1))
     pred_l = project_right_to_left(right_corners_raw, R_lr, T_lr)
     if pred_l is not None:
-        actual_l = undistort_points(left_corners_raw, K_LEFT, D_LEFT)
-        errors.append(np.linalg.norm(pred_l - actual_l, axis=1))
+        errors.append(np.linalg.norm(pred_l - np.asarray(left_corners_raw).reshape(-1, 2), axis=1))
     if not errors:
         return None
     all_e = np.concatenate(errors)
@@ -729,14 +715,8 @@ def main():
                     break
                 continue
 
-            undist_l = undistort_image(frame_l, K_LEFT, D_LEFT)
-            undist_r = undistort_image(frame_r, K_RIGHT, D_RIGHT)
-
             left_ok, left_raw = find_chessboard(frame_l)
             right_ok, right_raw = find_chessboard(frame_r)
-
-            left_undist = undistort_points(left_raw, K_LEFT, D_LEFT) if left_ok else None
-            right_undist = undistort_points(right_raw, K_RIGHT, D_RIGHT) if right_ok else None
 
             pred_on_right = None
             pred_on_left = None
@@ -751,16 +731,16 @@ def main():
                     R, T, last_cost = refine_once(R, T, left_raw, right_raw)
                     err = mean_reprojection_error(R, T, left_raw, right_raw)
 
-            # Draw
-            disp_l = undist_l.copy()
-            disp_r = undist_r.copy()
+            # Draw on RAW frames
+            disp_l = frame_l.copy()
+            disp_r = frame_r.copy()
 
             if left_ok:
-                draw_connections(disp_l, left_undist)
-                draw_points(disp_l, left_undist, filled=True, radius=5)
+                draw_connections(disp_l, left_raw)
+                draw_points(disp_l, left_raw, filled=True, radius=5)
             if right_ok:
-                draw_connections(disp_r, right_undist)
-                draw_points(disp_r, right_undist, filled=True, radius=5)
+                draw_connections(disp_r, right_raw)
+                draw_points(disp_r, right_raw, filled=True, radius=5)
 
             # Projected points (blue rings)
             draw_points(disp_r, pred_on_right, filled=False, radius=5, color=BLUE)

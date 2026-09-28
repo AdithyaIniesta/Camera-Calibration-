@@ -341,7 +341,7 @@ def project_left_to_right(corners_left, R_lr, T_lr):
     proj, _ = cv2.projectPoints(
         pts_right.reshape(-1, 1, 3),
         np.zeros((3, 1)), np.zeros((3, 1)),
-        K_RIGHT, np.zeros((5, 1)),
+        K_RIGHT, D_RIGHT,
     )
     return proj.reshape(-1, 2)
 
@@ -356,20 +356,9 @@ def project_right_to_left(corners_right, R_lr, T_lr):
     proj, _ = cv2.projectPoints(
         pts_left.reshape(-1, 1, 3),
         np.zeros((3, 1)), np.zeros((3, 1)),
-        K_LEFT, np.zeros((5, 1)),
+        K_LEFT, D_LEFT,
     )
     return proj.reshape(-1, 2)
-
-
-def undistort_image(frame, K, D):
-    return cv2.undistort(frame, K, D, None, K)
-
-
-def undistort_points(pts, K, D):
-    return cv2.undistortPoints(
-        np.asarray(pts, dtype=np.float64).reshape(-1, 1, 2),
-        K, D, P=K,
-    ).reshape(-1, 2)
 
 
 # ============================================================
@@ -381,12 +370,10 @@ def reprojection_residuals(x, left_c, right_c):
     parts = []
     pred_r = project_left_to_right(left_c, R_lr, T_lr)
     if pred_r is not None:
-        actual_r = undistort_points(right_c, K_RIGHT, D_RIGHT)
-        parts.append((pred_r - actual_r).ravel())
+        parts.append((pred_r - np.asarray(right_c).reshape(-1, 2)).ravel())
     pred_l = project_right_to_left(right_c, R_lr, T_lr)
     if pred_l is not None:
-        actual_l = undistort_points(left_c, K_LEFT, D_LEFT)
-        parts.append((pred_l - actual_l).ravel())
+        parts.append((pred_l - np.asarray(left_c).reshape(-1, 2)).ravel())
     if not parts:
         return np.zeros(6)
     pix = np.concatenate(parts)
@@ -403,12 +390,10 @@ def mean_reprojection_error(R_lr, T_lr, left_c, right_c):
     errs = []
     pred_r = project_left_to_right(left_c, R_lr, T_lr)
     if pred_r is not None:
-        actual_r = undistort_points(right_c, K_RIGHT, D_RIGHT)
-        errs.append(np.linalg.norm(pred_r - actual_r, axis=1))
+        errs.append(np.linalg.norm(pred_r - np.asarray(right_c).reshape(-1, 2), axis=1))
     pred_l = project_right_to_left(right_c, R_lr, T_lr)
     if pred_l is not None:
-        actual_l = undistort_points(left_c, K_LEFT, D_LEFT)
-        errs.append(np.linalg.norm(pred_l - actual_l, axis=1))
+        errs.append(np.linalg.norm(pred_l - np.asarray(left_c).reshape(-1, 2), axis=1))
     if not errs:
         return None
     all_e = np.concatenate(errs)
@@ -562,14 +547,8 @@ def main():
                     break
                 continue
 
-            und_l = undistort_image(fl, K_LEFT, D_LEFT)
-            und_r = undistort_image(fr, K_RIGHT, D_RIGHT)
-
             l_ok, l_raw = find_tag(fl)
             r_ok, r_raw = find_tag(fr)
-
-            l_un = undistort_points(l_raw, K_LEFT, D_LEFT) if l_ok else None
-            r_un = undistort_points(r_raw, K_RIGHT, D_RIGHT) if r_ok else None
 
             pred_r = pred_l = None
             err = None
@@ -581,12 +560,12 @@ def main():
                     R, T, last_cost = refine_once(R, T, l_raw, r_raw)
                     err = mean_reprojection_error(R, T, l_raw, r_raw)
 
-            disp_l = und_l.copy()
-            disp_r = und_r.copy()
+            disp_l = fl.copy()
+            disp_r = fr.copy()
             if l_ok:
-                draw_tag(disp_l, l_un, GREEN, filled=True)
+                draw_tag(disp_l, l_raw, GREEN, filled=True)
             if r_ok:
-                draw_tag(disp_r, r_un, GREEN, filled=True)
+                draw_tag(disp_r, r_raw, GREEN, filled=True)
             if pred_r is not None:
                 draw_tag(disp_r, pred_r, BLUE, filled=False)
             if pred_l is not None:

@@ -299,7 +299,7 @@ def project_left_to_right(corners_left_raw, R_lr, T_lr):
         np.zeros((3, 1)),
         np.zeros((3, 1)),
         K_RIGHT,
-        np.zeros((5, 1)),
+        D_RIGHT,
     )
     return proj.reshape(-1, 2)
 
@@ -316,7 +316,7 @@ def project_right_to_left(corners_right_raw, R_lr, T_lr):
         np.zeros((3, 1)),
         np.zeros((3, 1)),
         K_LEFT,
-        np.zeros((5, 1)),
+        D_LEFT,
     )
     return proj.reshape(-1, 2)
 
@@ -337,8 +337,9 @@ def error_stats(predicted, actual):
 
 
 def bidirectional_error(R_lr, T_lr, left_raw, right_raw):
-    actual_l = undistort_points(left_raw, K_LEFT, D_LEFT)
-    actual_r = undistort_points(right_raw, K_RIGHT, D_RIGHT)
+    # Raw-pixel residuals: compare distorted projections against detected corners.
+    actual_l = np.asarray(left_raw).reshape(-1, 2)
+    actual_r = np.asarray(right_raw).reshape(-1, 2)
     pred_r = project_left_to_right(left_raw, R_lr, T_lr)
     pred_l = project_right_to_left(right_raw, R_lr, T_lr)
     e_lr = error_stats(pred_r, actual_r)
@@ -504,8 +505,7 @@ def save_comparison(path, left_raw, right_raw, err_orig, err_ref, pred_l_o, pred
     payload = {
         "left_corners_raw": np.asarray(left_raw).tolist(),
         "right_corners_raw": np.asarray(right_raw).tolist(),
-        "left_corners_undistorted": np.asarray(actual_l).tolist() if actual_l is not None else None,
-        "right_corners_undistorted": np.asarray(actual_r).tolist() if actual_r is not None else None,
+        "space": "raw_pixels",
         "original": {
             "error_combined": err_orig,
             "projected_on_left": np.asarray(pred_l_o).tolist() if pred_l_o is not None else None,
@@ -542,10 +542,7 @@ def save_comparison(path, left_raw, right_raw, err_orig, err_ref, pred_l_o, pred
 # ============================================================
 
 def process_pair(frame_l, frame_r):
-    """Returns everything needed for display + metrics."""
-    undist_l = undistort_image(frame_l, K_LEFT, D_LEFT)
-    undist_r = undistort_image(frame_r, K_RIGHT, D_RIGHT)
-
+    """Returns everything needed for display + metrics — all in RAW pixel space."""
     left_ok, left_raw = find_chessboard(frame_l)
     right_ok, right_raw = find_chessboard(frame_r)
 
@@ -562,8 +559,8 @@ def process_pair(frame_l, frame_r):
         )
 
     return {
-        "undist_l": undist_l,
-        "undist_r": undist_r,
+        "raw_l": frame_l,
+        "raw_r": frame_r,
         "left_ok": left_ok,
         "right_ok": right_ok,
         "left_raw": left_raw,
@@ -603,8 +600,8 @@ def render(state, frozen):
 
     Side panel: quantitative comparison.
     """
-    ul = state["undist_l"]
-    ur = state["undist_r"]
+    ul = state["raw_l"]
+    ur = state["raw_r"]
     al = state["actual_l"]
     ar = state["actual_r"]
 
