@@ -3,5 +3,8 @@
 # (sudo apt install python3-opencv) — it's built with GStreamer support,
 # which the pip opencv-contrib-python wheel lacks. GStreamer itself and
 # nvvidconv come from JetPack.
-numpy>=1.23
+# JetPack's system OpenCV is built against NumPy 1.x; NumPy 2 breaks `import cv2`
+# with "numpy.core.multiarray failed to import". Cap until JetPack ships a
+# NumPy-2 build of OpenCV.
+numpy>=1.23,<2
 scipy>=1.10
