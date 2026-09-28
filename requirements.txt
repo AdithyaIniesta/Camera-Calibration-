@@ -1,3 +1,7 @@
+# Pip-installable deps only.
+# OpenCV is intentionally NOT here: on Jetson use JetPack's system OpenCV
+# (sudo apt install python3-opencv) — it's built with GStreamer support,
+# which the pip opencv-contrib-python wheel lacks. GStreamer itself and
+# nvvidconv come from JetPack.
 numpy>=1.23
 scipy>=1.10
-opencv-contrib-python>=4.7

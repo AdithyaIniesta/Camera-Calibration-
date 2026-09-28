@@ -42,25 +42,24 @@ camera rig on a Jetson. Capture uses a strict Jetson GStreamer pipeline:
 
 ## Requirements
 
-- Jetson with JetPack (GStreamer + `nvvidconv`)
+- Jetson with JetPack — provides GStreamer, `nvvidconv`, and a GStreamer-enabled
+  OpenCV. The pip `opencv-*` wheels are built **without** GStreamer support and
+  will silently fail to open the pipeline, so use the system OpenCV:
+
+  ```bash
+  sudo apt install python3-opencv
+  ```
+
 - Two UYVY-capable cameras at `/dev/videoN`
-- Python deps in `requirements.txt` (numpy, scipy, opencv-contrib-python)
+- Python deps:
 
-## Docker
+  ```bash
+  pip3 install -r requirements.txt   # numpy, scipy
+  ```
 
-Build:
-
-```bash
-docker build -t camcal .
-```
-
-Run (Jetson, with cameras + X11 for the GUI):
+## Run
 
 ```bash
-docker run --rm -it --runtime nvidia \
-  --device /dev/video0 --device /dev/video1 \
-  -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix \
-  camcal \
-  python3 src/refine_stereo_extrinsics.py \
-    data/left_four.json data/right_four.json data/stereo_calibration.json
+python3 src/refine_stereo_extrinsics.py \
+  data/left_four.json data/right_four.json data/stereo_calibration.json
 ```
