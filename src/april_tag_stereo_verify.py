@@ -26,6 +26,7 @@ import json
 import threading
 import time
 
+import _opencv_cuda  # noqa: F401  (must import before cv2)
 import cv2
 import numpy as np
 

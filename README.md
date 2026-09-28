@@ -42,13 +42,17 @@ camera rig on a Jetson. Capture uses a strict Jetson GStreamer pipeline:
 
 ## Requirements
 
-- Jetson with JetPack — provides GStreamer, `nvvidconv`, and a GStreamer-enabled
-  OpenCV. The pip `opencv-*` wheels are built **without** GStreamer support and
-  will silently fail to open the pipeline, so use the system OpenCV:
+- Jetson with JetPack — provides GStreamer + `nvvidconv`.
+- OpenCV built with GStreamer + CUDA using
+  `scripts/build_opencv_cuda.sh` (from the jetson-tracking-perception repo),
+  installed to e.g. `/opt/opencv-4.10.0-cuda`. Point the scripts at it:
 
   ```bash
-  sudo apt install python3-opencv
+  export OPENCV_CUDA_PREFIX=/opt/opencv-4.10.0-cuda
   ```
+
+  If unset, the scripts fall back to system OpenCV (which may lack GStreamer
+  support and will fail to open the pipeline).
 
 - Two UYVY-capable cameras at `/dev/videoN`
 - Python deps:
@@ -60,6 +64,7 @@ camera rig on a Jetson. Capture uses a strict Jetson GStreamer pipeline:
 ## Run
 
 ```bash
+export OPENCV_CUDA_PREFIX=/opt/opencv-4.10.0-cuda
 python3 src/refine_stereo_extrinsics.py \
   data/left_four.json data/right_four.json data/stereo_calibration.json
 ```
