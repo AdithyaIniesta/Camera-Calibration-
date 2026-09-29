@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-Live stereo extrinsic refinement using an AprilTag.
+Live stereo extrinsic refinement using AprilTags (many tags per frame).
 
-Same idea as refine_stereo_extrinsics.py, but instead of a chessboard the
-correspondences come from a single AprilTag visible in both cameras. The
-tag gives 4 corner points per frame; each is a left↔right correspondence
-plus a 3D reference (its own 4 tag-frame corners), so solvePnP still
-works and the R, T refinement is identical in spirit.
+Detects every AprilTag visible in each camera; for every tag ID seen in
+BOTH cameras, its 4 corners contribute a left↔right correspondence pair
+plus a 3D reference (its own tag-frame corners). All matched tags feed a
+single least-squares fit of R, T.
 
-Prior knowledge encoded as soft constraints:
-  - Baseline length ≈ 45 mm
-  - Rx ≈ 20 deg
-  - Ry ≈ 0, Rz ≈ 0
+NO PRIORS — the cost is pure pixel reprojection, so the refined R, T is
+an INDEPENDENT check against the stereo calibration and CAD.
 
 Usage:
   # CLI:
@@ -22,7 +19,7 @@ Usage:
 
 Keys:
   O          run one optimization step
-  A          auto-refine continuously while tag is visible
+  A          auto-refine continuously while >=1 shared tag is visible
   S          save refined extrinsics to refined_extrinsics_apriltag.json
   R          reset to original extrinsics
   Q / ESC    quit
@@ -50,16 +47,8 @@ IMAGE_WIDTH = 1280
 IMAGE_HEIGHT = 720
 FPS = 60
 
-# Soft priors
-PRIOR_BASELINE_MM = 45.0
-PRIOR_RX_DEG = 20.0
-PRIOR_RY_DEG = 0.0
-PRIOR_RZ_DEG = 0.0
-
-W_BASELINE = 2.0
-W_RX = 0.5
-W_RY = 1.0
-W_RZ = 1.0
+# No priors — cost is pure pixel reprojection so the result is an
+# independent check of the stereo calibration for the CAD team.
 
 WINDOW_NAME = "Stereo Extrinsic Refinement (AprilTag)"
 
@@ -95,11 +84,6 @@ parser.add_argument("--tag-family", default="36h11",
                     help="AprilTag family (default: 36h11)")
 parser.add_argument("--out", default="refined_extrinsics_apriltag.json",
                     help="Output path (default: refined_extrinsics_apriltag.json)")
-parser.add_argument("--baseline", type=float, default=PRIOR_BASELINE_MM,
-                    help=f"Prior baseline in mm (default: {PRIOR_BASELINE_MM})")
-parser.add_argument("--rx", type=float, default=PRIOR_RX_DEG,
-                    help=f"Prior Rx in degrees (default: {PRIOR_RX_DEG})")
-
 from _argpick import parse_or_pick
 args = parse_or_pick(
     parser,
@@ -110,9 +94,6 @@ args = parse_or_pick(
     ],
     ask_missing_options=[("tag-size", "AprilTag side length in mm (black square)")],
 )
-
-PRIOR_BASELINE_MM = args.baseline
-PRIOR_RX_DEG = args.rx
 TAG_SIZE_MM = float(args.tag_size)
 
 
@@ -275,13 +256,16 @@ TAG_OBJECT_POINTS = np.array([
 ], dtype=np.float64)
 
 
-def find_tag(frame):
-    """Return (found, corners_2d) — 4x2 pixel corners of the first tag."""
+def find_tags(frame):
+    """Return {tag_id: corners_2d(4x2)} for every detected tag."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     corners, ids = _detect(gray)
     if ids is None or len(ids) == 0:
-        return False, None
-    return True, corners[0].reshape(-1, 2).astype(np.float64)
+        return {}
+    out = {}
+    for i, tag_id in enumerate(ids.ravel()):
+        out[int(tag_id)] = corners[i].reshape(-1, 2).astype(np.float64)
+    return out
 
 
 # ============================================================
@@ -365,35 +349,34 @@ def project_right_to_left(corners_right, R_lr, T_lr):
 # COST / OPTIMIZATION
 # ============================================================
 
-def reprojection_residuals(x, left_c, right_c):
+def reprojection_residuals(x, matches):
+    """
+    matches: list of (left_corners_4x2, right_corners_4x2) — one per tag ID
+             seen in BOTH cameras. Pure pixel residuals, no priors.
+    """
     R_lr, T_lr = unpack_params(x)
     parts = []
-    pred_r = project_left_to_right(left_c, R_lr, T_lr)
-    if pred_r is not None:
-        parts.append((pred_r - np.asarray(right_c).reshape(-1, 2)).ravel())
-    pred_l = project_right_to_left(right_c, R_lr, T_lr)
-    if pred_l is not None:
-        parts.append((pred_l - np.asarray(left_c).reshape(-1, 2)).ravel())
+    for left_c, right_c in matches:
+        pred_r = project_left_to_right(left_c, R_lr, T_lr)
+        if pred_r is not None:
+            parts.append((pred_r - right_c).ravel())
+        pred_l = project_right_to_left(right_c, R_lr, T_lr)
+        if pred_l is not None:
+            parts.append((pred_l - left_c).ravel())
     if not parts:
         return np.zeros(6)
-    pix = np.concatenate(parts)
-    priors = np.array([
-        W_BASELINE * (float(np.linalg.norm(T_lr)) - PRIOR_BASELINE_MM),
-        W_RX * (x[0] - PRIOR_RX_DEG),
-        W_RY * (x[1] - PRIOR_RY_DEG),
-        W_RZ * (x[2] - PRIOR_RZ_DEG),
-    ])
-    return np.concatenate([pix, priors])
+    return np.concatenate(parts)
 
 
-def mean_reprojection_error(R_lr, T_lr, left_c, right_c):
+def mean_reprojection_error(R_lr, T_lr, matches):
     errs = []
-    pred_r = project_left_to_right(left_c, R_lr, T_lr)
-    if pred_r is not None:
-        errs.append(np.linalg.norm(pred_r - np.asarray(right_c).reshape(-1, 2), axis=1))
-    pred_l = project_right_to_left(right_c, R_lr, T_lr)
-    if pred_l is not None:
-        errs.append(np.linalg.norm(pred_l - np.asarray(left_c).reshape(-1, 2), axis=1))
+    for left_c, right_c in matches:
+        pred_r = project_left_to_right(left_c, R_lr, T_lr)
+        if pred_r is not None:
+            errs.append(np.linalg.norm(pred_r - right_c, axis=1))
+        pred_l = project_right_to_left(right_c, R_lr, T_lr)
+        if pred_l is not None:
+            errs.append(np.linalg.norm(pred_l - left_c, axis=1))
     if not errs:
         return None
     all_e = np.concatenate(errs)
@@ -402,13 +385,14 @@ def mean_reprojection_error(R_lr, T_lr, left_c, right_c):
         "median": float(np.median(all_e)),
         "rms":    float(np.sqrt(np.mean(all_e ** 2))),
         "max":    float(np.max(all_e)),
+        "count":  int(all_e.size),
     }
 
 
-def refine_once(R_lr, T_lr, left_c, right_c):
+def refine_once(R_lr, T_lr, matches):
     x0 = pack_params(R_lr, T_lr)
     res = least_squares(reprojection_residuals, x0,
-                        args=(left_c, right_c),
+                        args=(matches,),
                         method="lm", max_nfev=80, verbose=0)
     R_new, T_new = unpack_params(res.x)
     return R_new, T_new, res.cost
@@ -465,54 +449,58 @@ def fit_to_screen(img, max_w=MAX_DISPLAY_WIDTH, max_h=MAX_DISPLAY_HEIGHT):
     return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
 
 
-def draw_panel(panel, left_ok, right_ok, err, auto_mode, last_cost):
+def draw_panel(panel, n_left, n_right, matched_ids, err, auto_mode, last_cost):
     panel[:] = DARK
     put_text(panel, "APRILTAG STEREO REFINE", (20, 40), scale=0.85, color=CYAN, thickness=3)
     cv2.line(panel, (20, 55), (PANEL_WIDTH - 20, 55), CYAN, 2)
 
-    put_text(panel, f"Tag: {args.tag_family}  size={TAG_SIZE_MM:.1f} mm",
+    put_text(panel, f"Tag family: {args.tag_family}  size={TAG_SIZE_MM:.1f} mm",
              (20, 90), scale=0.55, color=YELLOW, thickness=2)
 
-    put_text(panel, "Left  : " + ("DETECTED" if left_ok else "NOT DETECTED"),
-             (20, 130), scale=0.60, color=GREEN if left_ok else RED)
-    put_text(panel, "Right : " + ("DETECTED" if right_ok else "NOT DETECTED"),
-             (20, 160), scale=0.60, color=GREEN if right_ok else RED)
+    put_text(panel, f"Left  detected : {n_left}", (20, 130), scale=0.55,
+             color=GREEN if n_left else RED)
+    put_text(panel, f"Right detected : {n_right}", (20, 157), scale=0.55,
+             color=GREEN if n_right else RED)
+    put_text(panel, f"Matched IDs    : {len(matched_ids)}  {matched_ids[:8]}",
+             (20, 184), scale=0.50, color=CYAN)
+    put_text(panel, "NO PRIORS — pure reprojection cost",
+             (20, 214), scale=0.50, color=ORANGE)
 
     ang = rotation_matrix_to_euler_xyz(R)
     baseline = float(np.linalg.norm(T))
 
-    put_text(panel, "CURRENT R / T", (20, 205), scale=0.65, color=ORANGE)
-    put_text(panel, f"Rx : {ang[0]:+.3f} deg  (prior {PRIOR_RX_DEG:.1f})", (20, 235), scale=0.55, color=GREEN)
-    put_text(panel, f"Ry : {ang[1]:+.3f} deg  (prior {PRIOR_RY_DEG:.1f})", (20, 262), scale=0.55)
-    put_text(panel, f"Rz : {ang[2]:+.3f} deg  (prior {PRIOR_RZ_DEG:.1f})", (20, 289), scale=0.55)
-    put_text(panel, f"Tx : {T[0,0]:+.3f} mm", (20, 320), scale=0.55)
-    put_text(panel, f"Ty : {T[1,0]:+.3f} mm", (20, 347), scale=0.55, color=YELLOW)
-    put_text(panel, f"Tz : {T[2,0]:+.3f} mm", (20, 374), scale=0.55)
-    put_text(panel, f"Baseline : {baseline:.3f} mm  (prior {PRIOR_BASELINE_MM:.1f})",
-             (20, 405), scale=0.55, color=CYAN)
+    put_text(panel, "CURRENT R / T", (20, 255), scale=0.65, color=ORANGE)
+    put_text(panel, f"Rx : {ang[0]:+.3f} deg", (20, 285), scale=0.55, color=GREEN)
+    put_text(panel, f"Ry : {ang[1]:+.3f} deg", (20, 312), scale=0.55)
+    put_text(panel, f"Rz : {ang[2]:+.3f} deg", (20, 339), scale=0.55)
+    put_text(panel, f"Tx : {T[0,0]:+.3f} mm", (20, 370), scale=0.55)
+    put_text(panel, f"Ty : {T[1,0]:+.3f} mm", (20, 397), scale=0.55, color=YELLOW)
+    put_text(panel, f"Tz : {T[2,0]:+.3f} mm", (20, 424), scale=0.55)
+    put_text(panel, f"Baseline : {baseline:.3f} mm", (20, 455), scale=0.55, color=CYAN)
 
-    put_text(panel, "REPROJECTION ERROR", (20, 450), scale=0.65, color=ORANGE)
+    put_text(panel, "REPROJECTION ERROR", (20, 500), scale=0.65, color=ORANGE)
     if err is None:
-        put_text(panel, "Need tag in BOTH cameras", (20, 480), scale=0.55, color=YELLOW)
+        put_text(panel, "Need >=1 shared tag ID", (20, 530), scale=0.55, color=YELLOW)
     else:
-        put_text(panel, f"Mean   : {err['mean']:.3f} px", (20, 480), scale=0.55)
-        put_text(panel, f"Median : {err['median']:.3f} px", (20, 507), scale=0.55)
-        put_text(panel, f"RMS    : {err['rms']:.3f} px", (20, 534), scale=0.55, color=GREEN)
-        put_text(panel, f"Max    : {err['max']:.3f} px", (20, 561), scale=0.55)
+        put_text(panel, f"Points : {err['count']}", (20, 530), scale=0.55, color=WHITE)
+        put_text(panel, f"Mean   : {err['mean']:.3f} px", (20, 557), scale=0.55)
+        put_text(panel, f"Median : {err['median']:.3f} px", (20, 584), scale=0.55)
+        put_text(panel, f"RMS    : {err['rms']:.3f} px", (20, 611), scale=0.55, color=GREEN)
+        put_text(panel, f"Max    : {err['max']:.3f} px", (20, 638), scale=0.55)
     if last_cost is not None:
-        put_text(panel, f"Last LS cost : {last_cost:.4f}", (20, 595), scale=0.55, color=CYAN)
+        put_text(panel, f"Last LS cost : {last_cost:.4f}", (20, 672), scale=0.55, color=CYAN)
 
-    cv2.line(panel, (20, 630), (PANEL_WIDTH - 20, 630), CYAN, 2)
-    put_text(panel, "CONTROLS", (20, 665), scale=0.65, color=YELLOW)
-    put_text(panel, "O : one optimization step", (20, 695), scale=0.55)
+    cv2.line(panel, (20, 705), (PANEL_WIDTH - 20, 705), CYAN, 2)
+    put_text(panel, "CONTROLS", (20, 740), scale=0.65, color=YELLOW)
+    put_text(panel, "O : one optimization step", (20, 770), scale=0.55)
     put_text(panel, f"A : auto-refine  [{'ON' if auto_mode else 'OFF'}]",
-             (20, 722), scale=0.55, color=GREEN if auto_mode else WHITE)
-    put_text(panel, f"S : save {args.out}", (20, 749), scale=0.50, color=CYAN)
-    put_text(panel, "R : reset to original", (20, 776), scale=0.55, color=ORANGE)
-    put_text(panel, "Q / ESC : quit", (20, 803), scale=0.55, color=RED)
+             (20, 797), scale=0.55, color=GREEN if auto_mode else WHITE)
+    put_text(panel, f"S : save {args.out}", (20, 824), scale=0.50, color=CYAN)
+    put_text(panel, "R : reset to original", (20, 851), scale=0.55, color=ORANGE)
+    put_text(panel, "Q / ESC : quit", (20, 878), scale=0.55, color=RED)
 
-    put_text(panel, "Filled dots  = detected corners", (20, 850), scale=0.50)
-    put_text(panel, "Blue rings   = projected via R/T", (20, 875), scale=0.50, color=BLUE)
+    put_text(panel, "Green fill = detected  |  Blue ring = projected via R/T",
+             (20, 920), scale=0.48)
 
 
 # ============================================================
@@ -536,7 +524,7 @@ def main():
     last_cost = None
 
     print("\nControls: O=optimize, A=auto, S=save, R=reset, Q=quit")
-    print(f"Priors: baseline={PRIOR_BASELINE_MM} mm, Rx={PRIOR_RX_DEG} deg\n")
+    print("Cost: pure reprojection over all AprilTag IDs seen in BOTH cameras.\n")
 
     try:
         while True:
@@ -547,36 +535,46 @@ def main():
                     break
                 continue
 
-            l_ok, l_raw = find_tag(fl)
-            r_ok, r_raw = find_tag(fr)
+            tags_l = find_tags(fl)   # {id: corners}
+            tags_r = find_tags(fr)
+            common_ids = sorted(set(tags_l) & set(tags_r))
+            matches = [(tags_l[i], tags_r[i]) for i in common_ids]
 
-            pred_r = pred_l = None
             err = None
-            if l_ok and r_ok:
-                pred_r = project_left_to_right(l_raw, R, T)
-                pred_l = project_right_to_left(r_raw, R, T)
-                err = mean_reprojection_error(R, T, l_raw, r_raw)
+            if matches:
+                err = mean_reprojection_error(R, T, matches)
                 if auto_mode:
-                    R, T, last_cost = refine_once(R, T, l_raw, r_raw)
-                    err = mean_reprojection_error(R, T, l_raw, r_raw)
+                    R, T, last_cost = refine_once(R, T, matches)
+                    err = mean_reprojection_error(R, T, matches)
 
             disp_l = fl.copy()
             disp_r = fr.copy()
-            if l_ok:
-                draw_tag(disp_l, l_raw, GREEN, filled=True)
-            if r_ok:
-                draw_tag(disp_r, r_raw, GREEN, filled=True)
-            if pred_r is not None:
-                draw_tag(disp_r, pred_r, BLUE, filled=False)
-            if pred_l is not None:
-                draw_tag(disp_l, pred_l, BLUE, filled=False)
 
-            put_text(disp_l, "LEFT / BORESIGHT", (20, 40), scale=0.80, color=CYAN, thickness=3)
-            put_text(disp_r, "RIGHT / DEPRESSION", (20, 40), scale=0.80, color=ORANGE, thickness=3)
+            # Detected tags (green) — all of them, with ID label.
+            for tid, c in tags_l.items():
+                draw_tag(disp_l, c, GREEN if tid in common_ids else ORANGE, filled=True)
+                cx, cy = c.mean(axis=0)
+                put_text(disp_l, f"#{tid}", (int(cx), int(cy)), scale=0.6, color=YELLOW)
+            for tid, c in tags_r.items():
+                draw_tag(disp_r, c, GREEN if tid in common_ids else ORANGE, filled=True)
+                cx, cy = c.mean(axis=0)
+                put_text(disp_r, f"#{tid}", (int(cx), int(cy)), scale=0.6, color=YELLOW)
+
+            # Projected tags via current R,T (blue rings) — only common IDs.
+            for tid in common_ids:
+                pr = project_left_to_right(tags_l[tid], R, T)
+                pl = project_right_to_left(tags_r[tid], R, T)
+                if pr is not None:
+                    draw_tag(disp_r, pr, BLUE, filled=False)
+                if pl is not None:
+                    draw_tag(disp_l, pl, BLUE, filled=False)
+
+            put_text(disp_l, "LEFT / BORESIGHT",  (20, 40), scale=0.80, color=CYAN,   thickness=3)
+            put_text(disp_r, "RIGHT / DEPRESSION",(20, 40), scale=0.80, color=ORANGE, thickness=3)
 
             views = np.vstack((disp_l, disp_r))
             panel = np.zeros((views.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
-            draw_panel(panel, l_ok, r_ok, err, auto_mode, last_cost)
+            draw_panel(panel, len(tags_l), len(tags_r), common_ids, err, auto_mode, last_cost)
 
             cv2.imshow(WINDOW_NAME, fit_to_screen(np.hstack((views, panel))))
 
@@ -584,35 +582,30 @@ def main():
             if key in (ord("q"), 27):
                 break
             elif key == ord("o"):
-                if l_ok and r_ok:
-                    R, T, last_cost = refine_once(R, T, l_raw, r_raw)
-                    e = mean_reprojection_error(R, T, l_raw, r_raw)
+                if matches:
+                    R, T, last_cost = refine_once(R, T, matches)
+                    e = mean_reprojection_error(R, T, matches)
                     a = rotation_matrix_to_euler_xyz(R)
-                    print(f"[OPT] cost={last_cost:.4f}  RMS={e['rms']:.3f}px  "
+                    print(f"[OPT] tags={len(matches)}  cost={last_cost:.4f}  "
+                          f"RMS={e['rms']:.3f}px  n={e['count']}  "
                           f"Rx={a[0]:+.3f} Ry={a[1]:+.3f} Rz={a[2]:+.3f}  "
                           f"T=({T[0,0]:+.2f},{T[1,0]:+.2f},{T[2,0]:+.2f})  "
                           f"base={np.linalg.norm(T):.2f}")
                 else:
-                    print("[OPT] Need tag in BOTH cameras")
+                    print("[OPT] no shared tag IDs between cameras")
             elif key == ord("a"):
                 auto_mode = not auto_mode
                 print(f"[AUTO] {'ON' if auto_mode else 'OFF'}")
             elif key == ord("s"):
-                e = None
-                if l_ok and r_ok:
-                    e = mean_reprojection_error(R, T, l_raw, r_raw)
+                e = mean_reprojection_error(R, T, matches) if matches else None
                 save_extrinsics(args.out, R, T, extra={
                     "source_extrinsic_json": str(args.extrinsic_json),
                     "left_json": str(args.left_json),
                     "right_json": str(args.right_json),
                     "tag_family": args.tag_family,
                     "tag_size_mm": TAG_SIZE_MM,
-                    "priors": {
-                        "baseline_mm": PRIOR_BASELINE_MM,
-                        "rx_deg": PRIOR_RX_DEG,
-                        "ry_deg": PRIOR_RY_DEG,
-                        "rz_deg": PRIOR_RZ_DEG,
-                    },
+                    "priors_used": False,
+                    "shared_tag_ids_at_save": common_ids,
                     "reprojection_error_px": e,
                 })
             elif key == ord("r"):
