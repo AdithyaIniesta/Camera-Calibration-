@@ -40,8 +40,8 @@ from scipy.optimize import least_squares
 # CONFIGURATION
 # ============================================================
 
-LEFT_DEVICE = "/dev/video1"       # BORESIGHT / LEFT
-RIGHT_DEVICE = "/dev/video3"      # DEPRESSION / RIGHT
+LEFT_DEVICE = "/dev/video0"       # BORESIGHT / LEFT
+RIGHT_DEVICE = "/dev/video2"      # DEPRESSION / RIGHT
 
 IMAGE_WIDTH = 1280
 IMAGE_HEIGHT = 720
