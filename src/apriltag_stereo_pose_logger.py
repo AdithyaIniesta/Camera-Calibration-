@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
-Stereo AprilTag pose logger — poses expressed in the LEFT camera frame.
+Stereo AprilTag pose logger.
 
-Given:
-  - LEFT camera intrinsic JSON  (K_L, D_L)
-  - RIGHT camera intrinsic JSON (K_R, D_R)
-  - Stereo extrinsic JSON       (R, T  left→right)
+Each camera detects and solves poses INDEPENDENTLY. A tag only needs to be
+in ONE camera to be logged. If it happens to be in BOTH cameras, extra
+cross-check fields are added, but overlap is NOT required.
 
-For every AprilTag visible in BOTH cameras it computes the tag pose
-THREE independent ways, all expressed in the LEFT camera frame:
+Per tag ID the JSON entry contains:
+  - "left"  (if seen by left camera):
+      pose_in_left_frame  (from solvePnP on left image)
+  - "right" (if seen by right camera):
+      pose_in_right_frame                (from solvePnP on right image)
+      pose_in_left_frame_via_extrinsic   (same transformed via stereo R,T)
+  - if seen by BOTH:
+      triangulated_pose_in_left_frame    (from triangulatePoints + rigid fit)
+      disagreements_left_frame           (mm/deg gaps between the three)
 
-  1. pnp_left        : solvePnP on left image (direct).
-  2. pnp_right_xf    : solvePnP on right image, transformed into left frame
-                       using the stereo extrinsic: X_L = R^T (X_R - T).
-  3. triangulated    : cv2.triangulatePoints on the 4 tag corners in both
-                       cameras, then solvePnP on the 3D points to recover
-                       a rigid tag→camera transform.
-
-Agreement between these three is the sanity check. If they diverge more
-than ~1–2 cm in position or ~2° in orientation, one of the calibrations
-is off (intrinsics, extrinsics, or tag_size).
+Each camera therefore delivers a stand-alone distance measurement in its
+own frame (`distance_mm` under `pose_in_left_frame` or `pose_in_right_frame`)
+even when the tag is outside the other camera's FOV.
 
 Keys
-    S    snapshot current frame's stereo detections to the JSON log
-    A    auto-log every frame with ≥1 matched tag (toggle)
+    S    snapshot current frame's detections to the JSON log
+    A    auto-log every frame with >=1 tag in either camera (toggle)
     W    write log to --out and clear
     Q    quit (also flushes)
 
@@ -31,7 +30,7 @@ CLI
     python3 apriltag_stereo_pose_logger.py \\
         left.json right.json stereo_extrinsic.json --tag-size 60
 
-    (or no args → file dialogs + tag-size prompt)
+    (or no args -> file dialogs + tag-size prompt)
 """
 import argparse
 import json
@@ -348,58 +347,85 @@ log_frames = []
 frame_seq = 0
 
 
-def compute_stereo_pose_entry(tag_id, corners_L, corners_R):
-    """Compute the three pose estimates + disagreement metrics."""
-    # 1. PnP in left camera
-    R_L,  t_L  = pnp(corners_L, K_L, D_L)
-    # 2. PnP in right camera, transformed to left
-    R_Rr, t_Rr = pnp(corners_R, K_R, D_R)
-    R_Rxf, t_Rxf = (transform_pose_right_to_left(R_Rr, t_Rr)
-                    if R_Rr is not None else (None, None))
-    # 3. Triangulate corners → rigid fit to tag object points
-    pts3d = triangulate_corners(corners_L, corners_R)
-    R_tri, t_tri = rigid_fit(TAG_OBJ, pts3d)
-
-    def pose_block(R, t):
-        if R is None:
-            return None
-        T4 = np.eye(4)
-        T4[:3, :3] = R
-        T4[:3, 3]  = t.ravel()
-        return {
-            "tvec_mm":         t.ravel().tolist(),
-            "R":               R.tolist(),
-            "euler_xyz_deg":   R_to_euler_xyz(R),
-            "distance_mm":     float(np.linalg.norm(t)),
-            "T_tag_to_left_4x4": T4.tolist(),
-        }
-
-    disagreements = {}
-    if R_L is not None and R_Rxf is not None:
-        disagreements["pnp_left_vs_pnp_right_xf"] = {
-            "translation_mm": float(np.linalg.norm(t_L - t_Rxf)),
-            "rotation_deg":   rot_angle_diff(R_L, R_Rxf),
-        }
-    if R_L is not None:
-        disagreements["pnp_left_vs_triangulated"] = {
-            "translation_mm": float(np.linalg.norm(t_L - t_tri)),
-            "rotation_deg":   rot_angle_diff(R_L, R_tri),
-        }
-    if R_Rxf is not None:
-        disagreements["pnp_right_xf_vs_triangulated"] = {
-            "translation_mm": float(np.linalg.norm(t_Rxf - t_tri)),
-            "rotation_deg":   rot_angle_diff(R_Rxf, R_tri),
-        }
-
+def _pose_block(R, t):
+    if R is None:
+        return None
+    T4 = np.eye(4)
+    T4[:3, :3] = R
+    T4[:3, 3]  = t.ravel()
     return {
-        "id": tag_id,
-        "corners_left_raw":  corners_L.tolist(),
-        "corners_right_raw": corners_R.tolist(),
-        "pnp_left":          pose_block(R_L,   t_L),
-        "pnp_right_xf":      pose_block(R_Rxf, t_Rxf),
-        "triangulated":      pose_block(R_tri, t_tri),
-        "disagreements":     disagreements,
+        "tvec_mm":       t.ravel().tolist(),
+        "R":             R.tolist(),
+        "euler_xyz_deg": R_to_euler_xyz(R),
+        "distance_mm":   float(np.linalg.norm(t)),
+        "T_4x4":         T4.tolist(),
     }
+
+
+def compute_stereo_pose_entries(tags_L, tags_R):
+    """
+    Independent per-camera poses. A tag needs to be in ONLY ONE camera to be
+    logged. If it is in both, extra fields (right→left transform, triangulated
+    pose, disagreements) are added — otherwise those fields are absent.
+    Returns a list of entries.
+    """
+    ids = sorted(set(tags_L) | set(tags_R))
+    entries = []
+    for tid in ids:
+        entry = {"id": tid, "seen_by": [], "left": None, "right": None}
+
+        # LEFT (independent) — pose expressed in LEFT camera frame.
+        if tid in tags_L:
+            cL = tags_L[tid]
+            R_L, t_L = pnp(cL, K_L, D_L)
+            entry["seen_by"].append("left")
+            entry["left"] = {
+                "corners_raw": cL.tolist(),
+                "pose_in_left_frame": _pose_block(R_L, t_L),
+            }
+
+        # RIGHT (independent) — pose expressed in RIGHT camera frame,
+        # AND also transformed into LEFT frame via the stereo extrinsic
+        # so both cameras' poses live in a common frame for comparison.
+        if tid in tags_R:
+            cR = tags_R[tid]
+            R_R, t_R = pnp(cR, K_R, D_R)
+            entry["seen_by"].append("right")
+            R_Rxf, t_Rxf = (transform_pose_right_to_left(R_R, t_R)
+                            if R_R is not None else (None, None))
+            entry["right"] = {
+                "corners_raw": cR.tolist(),
+                "pose_in_right_frame":            _pose_block(R_R,  t_R),
+                "pose_in_left_frame_via_extrinsic": _pose_block(R_Rxf, t_Rxf),
+            }
+
+        # BOTH → add triangulation and cross-check disagreements.
+        if "left" in entry["seen_by"] and "right" in entry["seen_by"]:
+            R_L = np.asarray(entry["left"]["pose_in_left_frame"]["R"])
+            t_L = np.asarray(entry["left"]["pose_in_left_frame"]["tvec_mm"]).reshape(3,1)
+            R_Rxf = np.asarray(entry["right"]["pose_in_left_frame_via_extrinsic"]["R"])
+            t_Rxf = np.asarray(entry["right"]["pose_in_left_frame_via_extrinsic"]["tvec_mm"]).reshape(3,1)
+
+            pts3d = triangulate_corners(tags_L[tid], tags_R[tid])
+            R_tri, t_tri = rigid_fit(TAG_OBJ, pts3d)
+
+            entry["triangulated_pose_in_left_frame"] = _pose_block(R_tri, t_tri)
+            entry["disagreements_left_frame"] = {
+                "pnp_left_vs_pnp_right_xf": {
+                    "translation_mm": float(np.linalg.norm(t_L - t_Rxf)),
+                    "rotation_deg":   rot_angle_diff(R_L, R_Rxf),
+                },
+                "pnp_left_vs_triangulated": {
+                    "translation_mm": float(np.linalg.norm(t_L - t_tri)),
+                    "rotation_deg":   rot_angle_diff(R_L, R_tri),
+                },
+                "pnp_right_xf_vs_triangulated": {
+                    "translation_mm": float(np.linalg.norm(t_Rxf - t_tri)),
+                    "rotation_deg":   rot_angle_diff(R_Rxf, R_tri),
+                },
+            }
+        entries.append(entry)
+    return entries
 
 
 def snapshot(entries, shape_L, shape_R):
@@ -474,40 +500,34 @@ def main():
             tags_R = find_tags(fr)
             common = sorted(set(tags_L) & set(tags_R))
 
-            entries = []
+            entries = compute_stereo_pose_entries(tags_L, tags_R)
+
             disp_L = fl.copy()
             disp_R = fr.copy()
 
-            for tid in common:
-                cL = tags_L[tid]
-                cR = tags_R[tid]
-                entry = compute_stereo_pose_entry(tid, cL, cR)
-                entries.append(entry)
-
-                # Draw left with axes from pnp_left, right with axes from pnp_right
+            # Draw every LEFT detection independently (green if also in right,
+            # orange if only in left).
+            for tid, cL in tags_L.items():
                 R_L_full, t_L_full = pnp(cL, K_L, D_L)
-                R_Rr_full, t_Rr_full = pnp(cR, K_R, D_R)
                 rvec_L = cv2.Rodrigues(R_L_full)[0] if R_L_full is not None else None
-                rvec_R = cv2.Rodrigues(R_Rr_full)[0] if R_Rr_full is not None else None
-                d_L = entry["pnp_left"]["distance_mm"] if entry["pnp_left"] else 0
-                d_R = entry["pnp_right_xf"]["distance_mm"] if entry["pnp_right_xf"] else 0
-                draw_tag(disp_L, cL, tid, d_L, GREEN,
+                d = float(np.linalg.norm(t_L_full)) if t_L_full is not None else 0.0
+                draw_tag(disp_L, cL, tid, d,
+                         GREEN if tid in common else ORANGE,
                          rvec=rvec_L, tvec=t_L_full, K=K_L, D=D_L)
-                draw_tag(disp_R, cR, tid, d_R, GREEN,
-                         rvec=rvec_R, tvec=t_Rr_full, K=K_R, D=D_R)
 
-            # Draw un-matched detections in orange
-            for tid, c in tags_L.items():
-                if tid not in common:
-                    draw_tag(disp_L, c, tid, 0.0, ORANGE)
-            for tid, c in tags_R.items():
-                if tid not in common:
-                    draw_tag(disp_R, c, tid, 0.0, ORANGE)
+            # Draw every RIGHT detection independently.
+            for tid, cR in tags_R.items():
+                R_R_full, t_R_full = pnp(cR, K_R, D_R)
+                rvec_R = cv2.Rodrigues(R_R_full)[0] if R_R_full is not None else None
+                d = float(np.linalg.norm(t_R_full)) if t_R_full is not None else 0.0
+                draw_tag(disp_R, cR, tid, d,
+                         GREEN if tid in common else ORANGE,
+                         rvec=rvec_R, tvec=t_R_full, K=K_R, D=D_R)
 
             # HUD
-            put_text(disp_L, f"LEFT  detected={len(tags_L)} matched={len(common)}",
+            put_text(disp_L, f"LEFT  detected={len(tags_L)} shared={len(common)}",
                      (20, 35), scale=0.65, color=CYAN)
-            put_text(disp_R, f"RIGHT detected={len(tags_R)} matched={len(common)}",
+            put_text(disp_R, f"RIGHT detected={len(tags_R)} shared={len(common)}",
                      (20, 35), scale=0.65, color=ORANGE)
             put_text(disp_L, f"logged={len(log_frames)}  AUTO={'ON' if auto else 'OFF'}",
                      (20, 65), scale=0.55, color=GREEN if auto else WHITE)
@@ -527,20 +547,22 @@ def main():
                 if entries:
                     e = snapshot(entries, fl.shape, fr.shape)
                     print(f"[SNAP] frame {e['frame_index']}: "
-                          f"{len(e['tags'])} matched tag(s) "
-                          f"({[t['id'] for t in e['tags']]})")
+                          f"{len(e['tags'])} tag(s)")
                     for t in entries:
-                        d = t["disagreements"]
-                        if "pnp_left_vs_pnp_right_xf" in d:
-                            k = d["pnp_left_vs_pnp_right_xf"]
-                            print(f"   id{t['id']}: L-vs-Rxf  Δt={k['translation_mm']:.2f} mm  "
-                                  f"Δrot={k['rotation_deg']:.2f} deg")
-                        if "pnp_left_vs_triangulated" in d:
-                            k = d["pnp_left_vs_triangulated"]
-                            print(f"   id{t['id']}: L-vs-Tri  Δt={k['translation_mm']:.2f} mm  "
+                        by = "+".join(t["seen_by"])
+                        if t.get("left"):
+                            d = t["left"]["pose_in_left_frame"]["distance_mm"]
+                            print(f"   id{t['id']:>3d} [{by:>10s}]  L-dist={d:7.1f} mm")
+                        if t.get("right"):
+                            d = t["right"]["pose_in_right_frame"]["distance_mm"]
+                            print(f"                       R-dist={d:7.1f} mm")
+                        dis = t.get("disagreements_left_frame")
+                        if dis:
+                            k = dis["pnp_left_vs_pnp_right_xf"]
+                            print(f"                       L-vs-Rxf  Δt={k['translation_mm']:.2f} mm  "
                                   f"Δrot={k['rotation_deg']:.2f} deg")
                 else:
-                    print("[SNAP] no matched tags")
+                    print("[SNAP] no tags detected in either camera")
             elif key == ord("a"):
                 auto = not auto
                 print(f"[AUTO] {'ON' if auto else 'OFF'}")
