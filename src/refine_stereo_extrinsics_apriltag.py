@@ -18,6 +18,8 @@ Usage:
 
 Keys:
   S          swap source camera  (left→right  vs  right→left)
+  O          one optimization step (also detects on DST for this frame)
+  A          auto-refine (also detects on DST every frame while ON)
   W          write current R, T to refined_extrinsics_apriltag.json
   R          reset to the loaded extrinsic
   Q / ESC    quit
@@ -447,7 +449,7 @@ def fit_to_screen(img, max_w=MAX_DISPLAY_WIDTH, max_h=MAX_DISPLAY_HEIGHT):
     return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
 
 
-def draw_panel(panel, n_src, swap):
+def draw_panel(panel, n_src, swap, auto_mode, last_cost):
     panel[:] = DARK
     put_text(panel, "APRILTAG STEREO VIEW", (20, 40),
              scale=0.85, color=CYAN, thickness=3)
@@ -480,14 +482,21 @@ def draw_panel(panel, n_src, swap):
     put_text(panel, "CONTROLS", (20, 510), scale=0.65, color=YELLOW)
     put_text(panel, f"S : swap direction  [{'R->L' if swap else 'L->R'}]",
              (20, 540), scale=0.55, color=CYAN)
-    put_text(panel, f"W : write {args.out}", (20, 567), scale=0.50, color=CYAN)
-    put_text(panel, "R : reset to original", (20, 594), scale=0.55, color=ORANGE)
-    put_text(panel, "Q / ESC : quit", (20, 621), scale=0.55, color=RED)
+    put_text(panel, "O : one optimization step (detects DST once)",
+             (20, 567), scale=0.50)
+    put_text(panel, f"A : auto-refine  [{'ON' if auto_mode else 'OFF'}]",
+             (20, 594), scale=0.55, color=GREEN if auto_mode else WHITE)
+    if last_cost is not None:
+        put_text(panel, f"    last LS cost = {last_cost:.4f}",
+                 (20, 621), scale=0.48, color=CYAN)
+    put_text(panel, f"W : write {args.out}", (20, 648), scale=0.50, color=CYAN)
+    put_text(panel, "R : reset to original", (20, 675), scale=0.55, color=ORANGE)
+    put_text(panel, "Q / ESC : quit", (20, 702), scale=0.55, color=RED)
 
     put_text(panel, "Green fill = detected on SRC",
-             (20, 670), scale=0.48)
+             (20, 740), scale=0.48)
     put_text(panel, "Blue ring  = projected via R,T on DST",
-             (20, 695), scale=0.48, color=BLUE)
+             (20, 765), scale=0.48, color=BLUE)
 
 
 # ============================================================
@@ -510,9 +519,11 @@ def main():
     # False: detect in LEFT, project into RIGHT.
     # True : detect in RIGHT, project into LEFT.
     swap = False
+    auto_mode = False
+    last_cost = None
 
-    print("\nControls: S=swap direction, W=write, R=reset, Q=quit")
-    print("Detection runs on ONE side per frame; the other side gets the projection.\n")
+    print("\nControls: S=swap, O=optimize, A=auto, W=write, R=reset, Q=quit")
+    print("Detection runs on SRC every frame; DST is detected only on O or A.\n")
 
     try:
         while True:
@@ -530,7 +541,17 @@ def main():
             dst_frame = fl if swap else fr
             project_fn = project_right_to_left if swap else project_left_to_right
 
-            src_tags = find_tags(src_frame)   # {id: corners} — ONE side only
+            src_tags = find_tags(src_frame)   # {id: corners} — SRC every frame
+
+            # Auto-refine also needs DST detections; run them ONLY when needed.
+            if auto_mode and src_tags:
+                dst_tags = find_tags(dst_frame)
+                common = sorted(set(src_tags) & set(dst_tags))
+                if common:
+                    matches = ([(src_tags[i], dst_tags[i]) for i in common]
+                               if not swap
+                               else [(dst_tags[i], src_tags[i]) for i in common])
+                    R, T, last_cost = refine_once(R, T, matches)
 
             disp_l = fl.copy()
             disp_r = fr.copy()
@@ -562,7 +583,7 @@ def main():
 
             views = np.vstack((disp_l, disp_r))
             panel = np.zeros((views.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
-            draw_panel(panel, len(src_tags), swap)
+            draw_panel(panel, len(src_tags), swap, auto_mode, last_cost)
 
             cv2.imshow(WINDOW_NAME, fit_to_screen(np.hstack((views, panel))))
 
@@ -572,6 +593,28 @@ def main():
             elif key == ord("s"):
                 swap = not swap
                 print(f"[SWAP] direction = {'RIGHT -> LEFT' if swap else 'LEFT -> RIGHT'}")
+            elif key == ord("o"):
+                # One-shot: detect DST once and refine.
+                dst_tags = find_tags(dst_frame)
+                common = sorted(set(src_tags) & set(dst_tags))
+                if common:
+                    matches = ([(src_tags[i], dst_tags[i]) for i in common]
+                               if not swap
+                               else [(dst_tags[i], src_tags[i]) for i in common])
+                    R, T, last_cost = refine_once(R, T, matches)
+                    e = mean_reprojection_error(R, T, matches)
+                    a = rotation_matrix_to_euler_xyz(R)
+                    print(f"[OPT] tags={len(matches)}  cost={last_cost:.4f}  "
+                          f"RMS={e['rms']:.3f}px  n={e['count']}  "
+                          f"Rx={a[0]:+.3f} Ry={a[1]:+.3f} Rz={a[2]:+.3f}  "
+                          f"T=({T[0,0]:+.2f},{T[1,0]:+.2f},{T[2,0]:+.2f})  "
+                          f"base={np.linalg.norm(T):.2f}")
+                else:
+                    print("[OPT] no shared tag IDs between SRC and DST")
+            elif key == ord("a"):
+                auto_mode = not auto_mode
+                print(f"[AUTO] {'ON' if auto_mode else 'OFF'} — DST detection engaged"
+                      if auto_mode else "[AUTO] OFF")
             elif key == ord("w"):
                 save_extrinsics(args.out, R, T, extra={
                     "source_extrinsic_json": str(args.extrinsic_json),
