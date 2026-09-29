@@ -20,7 +20,8 @@ Usage:
 Keys:
   O          run one optimization step
   A          auto-refine continuously while >=1 shared tag is visible
-  S          save refined extrinsics to refined_extrinsics_apriltag.json
+  S          swap projection direction (left→right  vs  right→left)
+  W          write refined extrinsics to refined_extrinsics_apriltag.json
   R          reset to original extrinsics
   Q / ESC    quit
 """
@@ -449,7 +450,7 @@ def fit_to_screen(img, max_w=MAX_DISPLAY_WIDTH, max_h=MAX_DISPLAY_HEIGHT):
     return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
 
 
-def draw_panel(panel, n_left, n_right, matched_ids, err, auto_mode, last_cost):
+def draw_panel(panel, n_left, n_right, matched_ids, err, auto_mode, last_cost, swap):
     panel[:] = DARK
     put_text(panel, "APRILTAG STEREO REFINE", (20, 40), scale=0.85, color=CYAN, thickness=3)
     cv2.line(panel, (20, 55), (PANEL_WIDTH - 20, 55), CYAN, 2)
@@ -465,6 +466,9 @@ def draw_panel(panel, n_left, n_right, matched_ids, err, auto_mode, last_cost):
              (20, 184), scale=0.50, color=CYAN)
     put_text(panel, "NO PRIORS — pure reprojection cost",
              (20, 214), scale=0.50, color=ORANGE)
+    put_text(panel,
+             f"Direction: {'RIGHT -> LEFT' if swap else 'LEFT -> RIGHT'}  (S to swap)",
+             (20, 235), scale=0.50, color=CYAN)
 
     ang = rotation_matrix_to_euler_xyz(R)
     baseline = float(np.linalg.norm(T))
@@ -495,9 +499,11 @@ def draw_panel(panel, n_left, n_right, matched_ids, err, auto_mode, last_cost):
     put_text(panel, "O : one optimization step", (20, 770), scale=0.55)
     put_text(panel, f"A : auto-refine  [{'ON' if auto_mode else 'OFF'}]",
              (20, 797), scale=0.55, color=GREEN if auto_mode else WHITE)
-    put_text(panel, f"S : save {args.out}", (20, 824), scale=0.50, color=CYAN)
-    put_text(panel, "R : reset to original", (20, 851), scale=0.55, color=ORANGE)
-    put_text(panel, "Q / ESC : quit", (20, 878), scale=0.55, color=RED)
+    put_text(panel, f"S : swap direction  [{'R->L' if swap else 'L->R'}]",
+             (20, 824), scale=0.55, color=CYAN)
+    put_text(panel, f"W : write {args.out}", (20, 851), scale=0.50, color=CYAN)
+    put_text(panel, "R : reset to original", (20, 878), scale=0.55, color=ORANGE)
+    put_text(panel, "Q / ESC : quit", (20, 905), scale=0.55, color=RED)
 
     put_text(panel, "Green fill = detected  |  Blue ring = projected via R/T",
              (20, 920), scale=0.48)
@@ -522,8 +528,11 @@ def main():
 
     auto_mode = False
     last_cost = None
+    # False: detect in LEFT, project into RIGHT.
+    # True : detect in RIGHT, project into LEFT.
+    swap = False
 
-    print("\nControls: O=optimize, A=auto, S=save, R=reset, Q=quit")
+    print("\nControls: O=optimize, A=auto, S=swap direction, W=write, R=reset, Q=quit")
     print("Cost: pure reprojection over all AprilTag IDs seen in BOTH cameras.\n")
 
     try:
@@ -560,21 +569,25 @@ def main():
                 cx, cy = c.mean(axis=0)
                 put_text(disp_r, f"#{tid}", (int(cx), int(cy)), scale=0.6, color=YELLOW)
 
-            # Projected tags via current R,T (blue rings) — only common IDs.
-            for tid in common_ids:
-                pr = project_left_to_right(tags_l[tid], R, T)
-                pl = project_right_to_left(tags_r[tid], R, T)
-                if pr is not None:
-                    draw_tag(disp_r, pr, BLUE, filled=False)
-                if pl is not None:
-                    draw_tag(disp_l, pl, BLUE, filled=False)
+            # Directional projection controlled by SWAP:
+            #   swap=False -> use every tag detected in LEFT, project into RIGHT
+            #   swap=True  -> use every tag detected in RIGHT, project into LEFT
+            src_tags = tags_r if swap else tags_l
+            dst_disp = disp_l if swap else disp_r
+            project_fn = project_right_to_left if swap else project_left_to_right
+            for tid, c in src_tags.items():
+                proj = project_fn(c, R, T)
+                if proj is not None:
+                    draw_tag(dst_disp, proj, BLUE, filled=False)
 
-            put_text(disp_l, "LEFT / BORESIGHT",  (20, 40), scale=0.80, color=CYAN,   thickness=3)
-            put_text(disp_r, "RIGHT / DEPRESSION",(20, 40), scale=0.80, color=ORANGE, thickness=3)
+            src_label = "SRC (detect)" if not swap else "DST (projected)"
+            dst_label = "DST (projected)" if not swap else "SRC (detect)"
+            put_text(disp_l, f"LEFT / BORESIGHT   [{src_label}]",  (20, 40), scale=0.75, color=CYAN,   thickness=3)
+            put_text(disp_r, f"RIGHT / DEPRESSION [{dst_label}]", (20, 40), scale=0.75, color=ORANGE, thickness=3)
 
             views = np.vstack((disp_l, disp_r))
             panel = np.zeros((views.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
-            draw_panel(panel, len(tags_l), len(tags_r), common_ids, err, auto_mode, last_cost)
+            draw_panel(panel, len(tags_l), len(tags_r), common_ids, err, auto_mode, last_cost, swap)
 
             cv2.imshow(WINDOW_NAME, fit_to_screen(np.hstack((views, panel))))
 
@@ -597,6 +610,9 @@ def main():
                 auto_mode = not auto_mode
                 print(f"[AUTO] {'ON' if auto_mode else 'OFF'}")
             elif key == ord("s"):
+                swap = not swap
+                print(f"[SWAP] direction = {'RIGHT -> LEFT' if swap else 'LEFT -> RIGHT'}")
+            elif key == ord("w"):
                 e = mean_reprojection_error(R, T, matches) if matches else None
                 save_extrinsics(args.out, R, T, extra={
                     "source_extrinsic_json": str(args.extrinsic_json),
