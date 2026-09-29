@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 """
-Live stereo extrinsic refinement using AprilTags (many tags per frame).
+Directional AprilTag stereo viewer.
 
-Detects every AprilTag visible in each camera; for every tag ID seen in
-BOTH cameras, its 4 corners contribute a left↔right correspondence pair
-plus a 3D reference (its own tag-frame corners). All matched tags feed a
-single least-squares fit of R, T.
+One camera at a time is the SOURCE: every AprilTag detected there is
+back-projected to 3D via solvePnP, transformed through the current stereo
+R, T, and projected into the OTHER (destination) camera image — blue ring.
+The destination camera does NOT run AprilTag detection.
 
-NO PRIORS — the cost is pure pixel reprojection, so the refined R, T is
-an INDEPENDENT check against the stereo calibration and CAD.
+Press S to swap which side is the source. Use it to eyeball whether the
+stereo calibration + priors-free extrinsic maps corners exactly onto the
+tag in the other view (no need for it to be in both simultaneously).
 
 Usage:
-  # CLI:
   python3 refine_stereo_extrinsics_apriltag.py \\
       left.json right.json extrinsics.json --tag-size 60
-
-  # No args -> file dialogs pop up and a prompt asks for --tag-size.
+  # or no args → file dialogs + tag-size prompt.
 
 Keys:
-  O          run one optimization step
-  A          auto-refine continuously while >=1 shared tag is visible
-  S          swap projection direction (left→right  vs  right→left)
-  W          write refined extrinsics to refined_extrinsics_apriltag.json
-  R          reset to original extrinsics
+  S          swap source camera  (left→right  vs  right→left)
+  W          write current R, T to refined_extrinsics_apriltag.json
+  R          reset to the loaded extrinsic
   Q / ESC    quit
 """
 
@@ -450,63 +447,47 @@ def fit_to_screen(img, max_w=MAX_DISPLAY_WIDTH, max_h=MAX_DISPLAY_HEIGHT):
     return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
 
 
-def draw_panel(panel, n_left, n_right, matched_ids, err, auto_mode, last_cost, swap):
+def draw_panel(panel, n_src, swap):
     panel[:] = DARK
-    put_text(panel, "APRILTAG STEREO REFINE", (20, 40), scale=0.85, color=CYAN, thickness=3)
+    put_text(panel, "APRILTAG STEREO VIEW", (20, 40),
+             scale=0.85, color=CYAN, thickness=3)
     cv2.line(panel, (20, 55), (PANEL_WIDTH - 20, 55), CYAN, 2)
 
     put_text(panel, f"Tag family: {args.tag_family}  size={TAG_SIZE_MM:.1f} mm",
-             (20, 90), scale=0.55, color=YELLOW, thickness=2)
-
-    put_text(panel, f"Left  detected : {n_left}", (20, 130), scale=0.55,
-             color=GREEN if n_left else RED)
-    put_text(panel, f"Right detected : {n_right}", (20, 157), scale=0.55,
-             color=GREEN if n_right else RED)
-    put_text(panel, f"Matched IDs    : {len(matched_ids)}  {matched_ids[:8]}",
-             (20, 184), scale=0.50, color=CYAN)
-    put_text(panel, "NO PRIORS — pure reprojection cost",
-             (20, 214), scale=0.50, color=ORANGE)
-    put_text(panel,
-             f"Direction: {'RIGHT -> LEFT' if swap else 'LEFT -> RIGHT'}  (S to swap)",
-             (20, 235), scale=0.50, color=CYAN)
+             (20, 95), scale=0.55, color=YELLOW, thickness=2)
+    direction = "RIGHT -> LEFT" if swap else "LEFT -> RIGHT"
+    put_text(panel, f"Direction: {direction}", (20, 125),
+             scale=0.60, color=CYAN, thickness=2)
+    put_text(panel, f"Tags detected on SRC: {n_src}", (20, 155),
+             scale=0.55, color=GREEN if n_src else RED)
+    put_text(panel, "Only one side is detected each frame.",
+             (20, 182), scale=0.48, color=WHITE)
 
     ang = rotation_matrix_to_euler_xyz(R)
     baseline = float(np.linalg.norm(T))
 
-    put_text(panel, "CURRENT R / T", (20, 255), scale=0.65, color=ORANGE)
-    put_text(panel, f"Rx : {ang[0]:+.3f} deg", (20, 285), scale=0.55, color=GREEN)
-    put_text(panel, f"Ry : {ang[1]:+.3f} deg", (20, 312), scale=0.55)
-    put_text(panel, f"Rz : {ang[2]:+.3f} deg", (20, 339), scale=0.55)
-    put_text(panel, f"Tx : {T[0,0]:+.3f} mm", (20, 370), scale=0.55)
-    put_text(panel, f"Ty : {T[1,0]:+.3f} mm", (20, 397), scale=0.55, color=YELLOW)
-    put_text(panel, f"Tz : {T[2,0]:+.3f} mm", (20, 424), scale=0.55)
-    put_text(panel, f"Baseline : {baseline:.3f} mm", (20, 455), scale=0.55, color=CYAN)
+    put_text(panel, "CURRENT R / T", (20, 230), scale=0.65, color=ORANGE)
+    put_text(panel, f"Rx : {ang[0]:+.3f} deg", (20, 260), scale=0.55, color=GREEN)
+    put_text(panel, f"Ry : {ang[1]:+.3f} deg", (20, 287), scale=0.55)
+    put_text(panel, f"Rz : {ang[2]:+.3f} deg", (20, 314), scale=0.55)
+    put_text(panel, f"Tx : {T[0,0]:+.3f} mm", (20, 345), scale=0.55)
+    put_text(panel, f"Ty : {T[1,0]:+.3f} mm", (20, 372), scale=0.55, color=YELLOW)
+    put_text(panel, f"Tz : {T[2,0]:+.3f} mm", (20, 399), scale=0.55)
+    put_text(panel, f"Baseline : {baseline:.3f} mm", (20, 430),
+             scale=0.55, color=CYAN)
 
-    put_text(panel, "REPROJECTION ERROR", (20, 500), scale=0.65, color=ORANGE)
-    if err is None:
-        put_text(panel, "Need >=1 shared tag ID", (20, 530), scale=0.55, color=YELLOW)
-    else:
-        put_text(panel, f"Points : {err['count']}", (20, 530), scale=0.55, color=WHITE)
-        put_text(panel, f"Mean   : {err['mean']:.3f} px", (20, 557), scale=0.55)
-        put_text(panel, f"Median : {err['median']:.3f} px", (20, 584), scale=0.55)
-        put_text(panel, f"RMS    : {err['rms']:.3f} px", (20, 611), scale=0.55, color=GREEN)
-        put_text(panel, f"Max    : {err['max']:.3f} px", (20, 638), scale=0.55)
-    if last_cost is not None:
-        put_text(panel, f"Last LS cost : {last_cost:.4f}", (20, 672), scale=0.55, color=CYAN)
-
-    cv2.line(panel, (20, 705), (PANEL_WIDTH - 20, 705), CYAN, 2)
-    put_text(panel, "CONTROLS", (20, 740), scale=0.65, color=YELLOW)
-    put_text(panel, "O : one optimization step", (20, 770), scale=0.55)
-    put_text(panel, f"A : auto-refine  [{'ON' if auto_mode else 'OFF'}]",
-             (20, 797), scale=0.55, color=GREEN if auto_mode else WHITE)
+    cv2.line(panel, (20, 475), (PANEL_WIDTH - 20, 475), CYAN, 2)
+    put_text(panel, "CONTROLS", (20, 510), scale=0.65, color=YELLOW)
     put_text(panel, f"S : swap direction  [{'R->L' if swap else 'L->R'}]",
-             (20, 824), scale=0.55, color=CYAN)
-    put_text(panel, f"W : write {args.out}", (20, 851), scale=0.50, color=CYAN)
-    put_text(panel, "R : reset to original", (20, 878), scale=0.55, color=ORANGE)
-    put_text(panel, "Q / ESC : quit", (20, 905), scale=0.55, color=RED)
+             (20, 540), scale=0.55, color=CYAN)
+    put_text(panel, f"W : write {args.out}", (20, 567), scale=0.50, color=CYAN)
+    put_text(panel, "R : reset to original", (20, 594), scale=0.55, color=ORANGE)
+    put_text(panel, "Q / ESC : quit", (20, 621), scale=0.55, color=RED)
 
-    put_text(panel, "Green fill = detected  |  Blue ring = projected via R/T",
-             (20, 920), scale=0.48)
+    put_text(panel, "Green fill = detected on SRC",
+             (20, 670), scale=0.48)
+    put_text(panel, "Blue ring  = projected via R,T on DST",
+             (20, 695), scale=0.48, color=BLUE)
 
 
 # ============================================================
@@ -526,14 +507,12 @@ def main():
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
-    auto_mode = False
-    last_cost = None
     # False: detect in LEFT, project into RIGHT.
     # True : detect in RIGHT, project into LEFT.
     swap = False
 
-    print("\nControls: O=optimize, A=auto, S=swap direction, W=write, R=reset, Q=quit")
-    print("Cost: pure reprojection over all AprilTag IDs seen in BOTH cameras.\n")
+    print("\nControls: S=swap direction, W=write, R=reset, Q=quit")
+    print("Detection runs on ONE side per frame; the other side gets the projection.\n")
 
     try:
         while True:
@@ -544,76 +523,56 @@ def main():
                     break
                 continue
 
-            tags_l = find_tags(fl)   # {id: corners}
-            tags_r = find_tags(fr)
-            common_ids = sorted(set(tags_l) & set(tags_r))
-            matches = [(tags_l[i], tags_r[i]) for i in common_ids]
+            # SINGLE-SIDE DETECTION.
+            #   swap=False -> detect in LEFT,  project into RIGHT
+            #   swap=True  -> detect in RIGHT, project into LEFT
+            src_frame = fr if swap else fl
+            dst_frame = fl if swap else fr
+            project_fn = project_right_to_left if swap else project_left_to_right
 
-            err = None
-            if matches:
-                err = mean_reprojection_error(R, T, matches)
-                if auto_mode:
-                    R, T, last_cost = refine_once(R, T, matches)
-                    err = mean_reprojection_error(R, T, matches)
+            src_tags = find_tags(src_frame)   # {id: corners} — ONE side only
 
             disp_l = fl.copy()
             disp_r = fr.copy()
+            disp_src = disp_r if swap else disp_l
+            disp_dst = disp_l if swap else disp_r
 
-            # Detected tags (green) — all of them, with ID label.
-            for tid, c in tags_l.items():
-                draw_tag(disp_l, c, GREEN if tid in common_ids else ORANGE, filled=True)
+            # Draw detections on the source view (green filled).
+            for tid, c in src_tags.items():
+                draw_tag(disp_src, c, GREEN, filled=True)
                 cx, cy = c.mean(axis=0)
-                put_text(disp_l, f"#{tid}", (int(cx), int(cy)), scale=0.6, color=YELLOW)
-            for tid, c in tags_r.items():
-                draw_tag(disp_r, c, GREEN if tid in common_ids else ORANGE, filled=True)
-                cx, cy = c.mean(axis=0)
-                put_text(disp_r, f"#{tid}", (int(cx), int(cy)), scale=0.6, color=YELLOW)
+                put_text(disp_src, f"#{tid}", (int(cx), int(cy)),
+                         scale=0.6, color=YELLOW)
 
-            # Directional projection controlled by SWAP:
-            #   swap=False -> use every tag detected in LEFT, project into RIGHT
-            #   swap=True  -> use every tag detected in RIGHT, project into LEFT
-            src_tags = tags_r if swap else tags_l
-            dst_disp = disp_l if swap else disp_r
-            project_fn = project_right_to_left if swap else project_left_to_right
+            # Project each src tag into the destination view (blue rings).
             for tid, c in src_tags.items():
                 proj = project_fn(c, R, T)
                 if proj is not None:
-                    draw_tag(dst_disp, proj, BLUE, filled=False)
+                    draw_tag(disp_dst, proj, BLUE, filled=False)
+                    cx, cy = proj.mean(axis=0)
+                    put_text(disp_dst, f"#{tid}", (int(cx), int(cy)),
+                             scale=0.6, color=BLUE)
 
             src_label = "SRC (detect)" if not swap else "DST (projected)"
             dst_label = "DST (projected)" if not swap else "SRC (detect)"
-            put_text(disp_l, f"LEFT / BORESIGHT   [{src_label}]",  (20, 40), scale=0.75, color=CYAN,   thickness=3)
-            put_text(disp_r, f"RIGHT / DEPRESSION [{dst_label}]", (20, 40), scale=0.75, color=ORANGE, thickness=3)
+            put_text(disp_l, f"LEFT / BORESIGHT   [{src_label}]",  (20, 40),
+                     scale=0.75, color=CYAN,   thickness=3)
+            put_text(disp_r, f"RIGHT / DEPRESSION [{dst_label}]", (20, 40),
+                     scale=0.75, color=ORANGE, thickness=3)
 
             views = np.vstack((disp_l, disp_r))
             panel = np.zeros((views.shape[0], PANEL_WIDTH, 3), dtype=np.uint8)
-            draw_panel(panel, len(tags_l), len(tags_r), common_ids, err, auto_mode, last_cost, swap)
+            draw_panel(panel, len(src_tags), swap)
 
             cv2.imshow(WINDOW_NAME, fit_to_screen(np.hstack((views, panel))))
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            elif key == ord("o"):
-                if matches:
-                    R, T, last_cost = refine_once(R, T, matches)
-                    e = mean_reprojection_error(R, T, matches)
-                    a = rotation_matrix_to_euler_xyz(R)
-                    print(f"[OPT] tags={len(matches)}  cost={last_cost:.4f}  "
-                          f"RMS={e['rms']:.3f}px  n={e['count']}  "
-                          f"Rx={a[0]:+.3f} Ry={a[1]:+.3f} Rz={a[2]:+.3f}  "
-                          f"T=({T[0,0]:+.2f},{T[1,0]:+.2f},{T[2,0]:+.2f})  "
-                          f"base={np.linalg.norm(T):.2f}")
-                else:
-                    print("[OPT] no shared tag IDs between cameras")
-            elif key == ord("a"):
-                auto_mode = not auto_mode
-                print(f"[AUTO] {'ON' if auto_mode else 'OFF'}")
             elif key == ord("s"):
                 swap = not swap
                 print(f"[SWAP] direction = {'RIGHT -> LEFT' if swap else 'LEFT -> RIGHT'}")
             elif key == ord("w"):
-                e = mean_reprojection_error(R, T, matches) if matches else None
                 save_extrinsics(args.out, R, T, extra={
                     "source_extrinsic_json": str(args.extrinsic_json),
                     "left_json": str(args.left_json),
@@ -621,13 +580,10 @@ def main():
                     "tag_family": args.tag_family,
                     "tag_size_mm": TAG_SIZE_MM,
                     "priors_used": False,
-                    "shared_tag_ids_at_save": common_ids,
-                    "reprojection_error_px": e,
                 })
             elif key == ord("r"):
                 R = R_INIT.copy()
                 T = T_INIT.copy()
-                last_cost = None
                 print("[RESET] Restored original extrinsics")
     finally:
         left_cam.stop()
