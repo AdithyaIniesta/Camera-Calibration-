@@ -21,9 +21,9 @@ own frame (`distance_mm` under `pose_in_left_frame` or `pose_in_right_frame`)
 even when the tag is outside the other camera's FOV.
 
 Keys
-    M    snapshot the current frame's detections to the log
-    W    write accumulated log to --out and clear
-    Q    quit (auto-flushes on exit)
+    M    snapshot current frame — REPLACES any previous snapshot in the log
+    W    write the current snapshot to --out
+    Q    quit (auto-flushes on exit, so M then Q also saves)
 
 CLI
     python3 apriltag_stereo_pose_logger.py \\
@@ -540,6 +540,8 @@ def main():
                 break
             elif key == ord("m"):
                 if entries:
+                    # Wipe any earlier snapshot — M always keeps only the latest.
+                    log_frames.clear()
                     e = snapshot(entries, fl.shape, fr.shape)
                     print(f"\n[SNAP] frame {e['frame_index']}  "
                           f"({len(e['tags'])} tag(s))")
