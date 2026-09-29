@@ -541,21 +541,31 @@ def main():
             elif key == ord("m"):
                 if entries:
                     e = snapshot(entries, fl.shape, fr.shape)
-                    print(f"[SNAP] frame {e['frame_index']}: "
-                          f"{len(e['tags'])} tag(s)")
+                    print(f"\n[SNAP] frame {e['frame_index']}  "
+                          f"({len(e['tags'])} tag(s))")
                     for t in entries:
-                        by = "+".join(t["seen_by"])
-                        if t.get("left"):
-                            d = t["left"]["pose_in_left_frame"]["distance_mm"]
-                            print(f"   id{t['id']:>3d} [{by:>10s}]  L-dist={d:7.1f} mm")
-                        if t.get("right"):
-                            d = t["right"]["pose_in_right_frame"]["distance_mm"]
-                            print(f"                       R-dist={d:7.1f} mm")
-                        dis = t.get("disagreements_left_frame")
-                        if dis:
-                            k = dis["pnp_left_vs_pnp_right_xf"]
-                            print(f"                       L-vs-Rxf  Δt={k['translation_mm']:.2f} mm  "
-                                  f"Δrot={k['rotation_deg']:.2f} deg")
+                        print(f"-- id {t['id']}  seen_by={'+'.join(t['seen_by'])}")
+
+                        def _fmt(name, block):
+                            if block is None:
+                                print(f"   {name:28s}  --")
+                                return
+                            tv = block["tvec_mm"]
+                            eu = block["euler_xyz_deg"]
+                            print(f"   {name:28s}  "
+                                  f"t=({tv[0]:+8.1f},{tv[1]:+8.1f},{tv[2]:+8.1f}) mm  "
+                                  f"euler=({eu[0]:+6.1f},{eu[1]:+6.1f},{eu[2]:+6.1f})°  "
+                                  f"|t|={block['distance_mm']:.1f} mm")
+
+                        L    = t.get("left",  {}).get("pose_in_left_frame")           if t.get("left")  else None
+                        Rr   = t.get("right", {}).get("pose_in_right_frame")          if t.get("right") else None
+                        Rxf  = t.get("right", {}).get("pose_in_left_frame_via_extrinsic") if t.get("right") else None
+                        Tri  = t.get("triangulated_pose_in_left_frame")
+
+                        _fmt("pnp_left        (Lframe)", L)
+                        _fmt("pnp_right       (Rframe)", Rr)
+                        _fmt("pnp_right_xf    (Lframe)", Rxf)
+                        _fmt("triangulated    (Lframe)", Tri)
                 else:
                     print("[SNAP] no tags detected in either camera")
             elif key == ord("w"):
