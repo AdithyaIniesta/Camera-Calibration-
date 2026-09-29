@@ -21,10 +21,9 @@ own frame (`distance_mm` under `pose_in_left_frame` or `pose_in_right_frame`)
 even when the tag is outside the other camera's FOV.
 
 Keys
-    S    snapshot current frame's detections to the JSON log
-    A    auto-log every frame with >=1 tag in either camera (toggle)
-    W    write log to --out and clear
-    Q    quit (also flushes)
+    M    snapshot the current frame's detections to the log
+    W    write accumulated log to --out and clear
+    Q    quit (auto-flushes on exit)
 
 CLI
     python3 apriltag_stereo_pose_logger.py \\
@@ -484,8 +483,7 @@ def main():
         return 1
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    auto = False
-    print("\nControls: S=snap, A=auto, W=write, Q/ESC=quit\n")
+    print("\nControls: M=snapshot, W=write, Q/ESC=quit  (no auto-log)\n")
 
     try:
         while True:
@@ -529,21 +527,18 @@ def main():
                      (20, 35), scale=0.65, color=CYAN)
             put_text(disp_R, f"RIGHT detected={len(tags_R)} shared={len(common)}",
                      (20, 35), scale=0.65, color=ORANGE)
-            put_text(disp_L, f"logged={len(log_frames)}  AUTO={'ON' if auto else 'OFF'}",
-                     (20, 65), scale=0.55, color=GREEN if auto else WHITE)
-            put_text(disp_L, "S=snap  A=auto  W=write  Q=quit",
+            put_text(disp_L, f"logged snapshots = {len(log_frames)}",
+                     (20, 65), scale=0.55, color=WHITE)
+            put_text(disp_L, "M=snap  W=write  Q=quit",
                      (20, disp_L.shape[0]-20), scale=0.55, color=YELLOW)
 
             combo = np.hstack((disp_L, disp_R))
             cv2.imshow(WINDOW_NAME, combo)
 
-            if auto and entries:
-                snapshot(entries, fl.shape, fr.shape)
-
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            elif key == ord("s"):
+            elif key == ord("m"):
                 if entries:
                     e = snapshot(entries, fl.shape, fr.shape)
                     print(f"[SNAP] frame {e['frame_index']}: "
@@ -563,9 +558,6 @@ def main():
                                   f"Δrot={k['rotation_deg']:.2f} deg")
                 else:
                     print("[SNAP] no tags detected in either camera")
-            elif key == ord("a"):
-                auto = not auto
-                print(f"[AUTO] {'ON' if auto else 'OFF'}")
             elif key == ord("w"):
                 flush(args.out)
     finally:
