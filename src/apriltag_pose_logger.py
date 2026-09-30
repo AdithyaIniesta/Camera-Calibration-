@@ -8,7 +8,10 @@ For every frame it:
   - runs solvePnP per tag → rvec, tvec, R (tag → camera),
   - builds the plane-induced homography H = K [r1 r2 t] (tag plane z=0
     in tag frame → image pixels, distorted with D on save),
-  - draws outlines, IDs and axes on the RAW frame.
+  - draws outlines, IDs and axes on the RAW frame,
+  - writes TWO JSON files: the poses (--out) and, next to it,
+    <--out stem>_angles.json with each tag's corner/centre angles measured
+    from the camera's own principal point (cx, cy).
 
 Keys:
   S      snapshot the current frame's detections to the JSON log
@@ -31,6 +34,7 @@ import _opencv_cuda  # noqa: F401  (must import before cv2)
 import cv2
 import numpy as np
 
+from _angles import corner_angles_entry
 from _argpick import parse_or_pick
 
 
@@ -281,7 +285,39 @@ def flush(path):
     }
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
-    print(f"[WRITE] {len(log_frames)} frame(s) -> {path}")
+
+    # Second file: corner/centre angles from this camera's own principal
+    # point (cx, cy), same convention as the C++ tracker (see _angles.py).
+    stem = path[:-5] if path.lower().endswith(".json") else path
+    angles_path = stem + "_angles.json"
+    angles_payload = {
+        "intrinsic_source": args.intrinsic_json,
+        "device": args.device,
+        "angle_convention": (
+            "alpha = atan2(u - cx, fx), positive right of the optical axis; "
+            "beta = atan2(-(v - cy), fy), positive above it. Measured from "
+            "this camera's own principal point (cx, cy), never the image "
+            "centre. Raw pixels, no undistortion (same as the C++ tracker)."),
+        "principal_point_px": {"cx": float(K[0, 2]), "cy": float(K[1, 2])},
+        "fx": float(K[0, 0]),
+        "fy": float(K[1, 1]),
+        "K": K.tolist(),
+        "tag_family": args.tag_family,
+        "tag_size_mm": TAG_SIZE_MM,
+        "num_frames_logged": len(log_frames),
+        "frames": [{
+            "frame_index": e["frame_index"],
+            "timestamp_utc": e["timestamp_utc"],
+            "image_width": e["image_width"],
+            "image_height": e["image_height"],
+            "tags": [dict(id=t["id"],
+                          **corner_angles_entry(np.asarray(t["corners_2d_raw"]), K))
+                     for t in e["tags"]],
+        } for e in log_frames],
+    }
+    with open(angles_path, "w") as f:
+        json.dump(angles_payload, f, indent=2)
+    print(f"[WRITE] {len(log_frames)} frame(s) -> {path}  +  {angles_path}")
     log_frames.clear()
 
 

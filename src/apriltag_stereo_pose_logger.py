@@ -3,11 +3,20 @@
 Stereo AprilTag pose logger — SPLIT OUTPUT (one JSON per camera).
 
 Each camera detects and solves poses INDEPENDENTLY in its OWN frame. On M
-the current detections are captured. On W (or on quit) TWO separate JSON
-files are written:
+the current detections are captured. On W (or on quit) FOUR JSON files are
+written, two per camera:
 
-    <--out>_left.json   : tags seen by the LEFT camera,  poses in LEFT frame.
-    <--out>_right.json  : tags seen by the RIGHT camera, poses in RIGHT frame.
+    <--out>_left.json          : LEFT camera tags, poses in LEFT frame.
+    <--out>_right.json         : RIGHT camera tags, poses in RIGHT frame.
+    <--out>_left_angles.json   : LEFT camera corner/centre angles.
+    <--out>_right_angles.json  : RIGHT camera corner/centre angles.
+
+The *_angles.json files hold, per tag, the 4 corners and the centre as
+bearings measured from that camera's OWN principal point (cx, cy) — the
+same convention as the C++ tracker (see _angles.py). The RIGHT file also
+carries each point's bearing rotated into the boresight frame with the
+stereo extrinsic, which is what the tracker reports for the depression
+camera.
 
 Each file is self-contained for the downstream parametric-homography step
 that will map corners from one image to the other. Every tag entry
@@ -27,7 +36,7 @@ to map corners from src → dst pixels.
 
 Keys
     M    snapshot current frame — REPLACES the previous snapshot
-    W    write both files to <--out>_{left,right}.json
+    W    write the four files
     Q    quit (auto-flushes on exit; M then Q also saves)
 
 CLI
@@ -46,6 +55,7 @@ import _opencv_cuda  # noqa: F401  (must import before cv2)
 import cv2
 import numpy as np
 
+from _angles import corner_angles_entry
 from _argpick import parse_or_pick
 
 
@@ -304,8 +314,10 @@ def draw_tag(img, corners, tag_id, dist_mm, color, rvec=None, tvec=None,
 # LOG
 # ============================================================
 
-last_snap_left  = None   # dict or None — latest LEFT-camera snapshot
-last_snap_right = None   # dict or None — latest RIGHT-camera snapshot
+last_snap_left  = None   # dict or None — latest LEFT-camera pose snapshot
+last_snap_right = None   # dict or None — latest RIGHT-camera pose snapshot
+last_ang_left   = None   # dict or None — matching LEFT corner-angle snapshot
+last_ang_right  = None   # dict or None — matching RIGHT corner-angle snapshot
 frame_seq = 0
 
 
@@ -348,9 +360,57 @@ def build_snapshot(tags, K, D, is_left, shape):
     }
 
 
+def build_angle_snapshot(tags, K, is_left, pose_snap):
+    """Corner/centre angles for the same tags as `pose_snap`, sharing its
+    frame_index / timestamp so the two files can be matched up."""
+    R_to_boresight = None if is_left else R_stereo
+    return {
+        "frame_index":   pose_snap["frame_index"],
+        "timestamp_utc": pose_snap["timestamp_utc"],
+        "image":         pose_snap["image"],
+        "tags":          {tid: corner_angles_entry(c, K, R_to_boresight)
+                          for tid, c in tags.items()},
+    }
+
+
 def _split_out_paths(base):
     base = base[:-5] if base.lower().endswith(".json") else base
     return base + "_left.json", base + "_right.json"
+
+
+def _angle_out_paths(base):
+    base = base[:-5] if base.lower().endswith(".json") else base
+    return base + "_left_angles.json", base + "_right_angles.json"
+
+
+def _angles_payload(ang_snap, is_left):
+    K = K_L if is_left else K_R
+    payload = {
+        "camera":     "left" if is_left else "right",
+        "device":     args.left_device if is_left else args.right_device,
+        "role":       "boresight" if is_left else "depression",
+        "angle_convention": (
+            "alpha = atan2(u - cx, fx), positive right of the optical axis; "
+            "beta = atan2(-(v - cy), fy), positive above it. Measured from "
+            "this camera's own principal point (cx, cy), never the image "
+            "centre. Raw pixels, no undistortion (same as the C++ tracker)."),
+        "principal_point_px": {"cx": float(K[0, 2]), "cy": float(K[1, 2])},
+        "fx": float(K[0, 0]),
+        "fy": float(K[1, 1]),
+        "K":  K.tolist(),
+        "tag_family":  args.tag_family,
+        "tag_size_mm": TAG_SIZE_MM,
+        "intrinsic":   args.left_json if is_left else args.right_json,
+    }
+    if not is_left:
+        payload["boresight_frame_note"] = (
+            "alpha_boresight_deg / beta_boresight_deg are this camera's "
+            "bearings rotated into the boresight (left) frame with "
+            "R_left_to_right^T, as the tracker reports the depression camera.")
+        payload["R_left_to_right"] = R_stereo.tolist()
+        payload["stereo_extrinsic"] = args.extrinsic_json
+    payload["snapshot"] = ang_snap
+    return payload
 
 
 def _payload(snap, is_left):
@@ -391,19 +451,25 @@ def _payload(snap, is_left):
 
 
 def flush(base_out):
-    global last_snap_left, last_snap_right
     if last_snap_left is None and last_snap_right is None:
         print("[WRITE] nothing to flush")
         return
     p_left, p_right = _split_out_paths(base_out)
+    a_left, a_right = _angle_out_paths(base_out)
     if last_snap_left is not None:
         with open(p_left, "w") as f:
             json.dump(_payload(last_snap_left, True), f, indent=2)
-        print(f"[WRITE] LEFT  -> {p_left}  ({len(last_snap_left['tags'])} tag(s))")
+        with open(a_left, "w") as f:
+            json.dump(_angles_payload(last_ang_left, True), f, indent=2)
+        print(f"[WRITE] LEFT  -> {p_left}  +  {a_left}  "
+              f"({len(last_snap_left['tags'])} tag(s))")
     if last_snap_right is not None:
         with open(p_right, "w") as f:
             json.dump(_payload(last_snap_right, False), f, indent=2)
-        print(f"[WRITE] RIGHT -> {p_right}  ({len(last_snap_right['tags'])} tag(s))")
+        with open(a_right, "w") as f:
+            json.dump(_angles_payload(last_ang_right, False), f, indent=2)
+        print(f"[WRITE] RIGHT -> {p_right}  +  {a_right}  "
+              f"({len(last_snap_right['tags'])} tag(s))")
 
 
 # ============================================================
@@ -411,6 +477,7 @@ def flush(base_out):
 # ============================================================
 
 def main():
+    global last_snap_left, last_snap_right, last_ang_left, last_ang_right
     cam_L = Camera(args.left_device)
     cam_R = Camera(args.right_device)
     if not cam_L.start():
@@ -473,6 +540,10 @@ def main():
                 # Replace the previous snapshot with the current one, PER CAMERA.
                 last_snap_left  = build_snapshot(tags_L, K_L, D_L, True,  fl.shape) if tags_L else None
                 last_snap_right = build_snapshot(tags_R, K_R, D_R, False, fr.shape) if tags_R else None
+                last_ang_left  = (build_angle_snapshot(tags_L, K_L, True,  last_snap_left)
+                                  if last_snap_left  else None)
+                last_ang_right = (build_angle_snapshot(tags_R, K_R, False, last_snap_right)
+                                  if last_snap_right else None)
 
                 nL = len(last_snap_left["tags"])  if last_snap_left  else 0
                 nR = len(last_snap_right["tags"]) if last_snap_right else 0
@@ -491,6 +562,20 @@ def main():
 
                 _print_side("L", last_snap_left)
                 _print_side("R", last_snap_right)
+
+                def _print_angles(name, ang):
+                    if ang is None:
+                        return
+                    for tid, a in ang["tags"].items():
+                        for c in a["corners"]:
+                            extra = (f"  bore=({c['alpha_boresight_deg']:+7.2f},"
+                                     f"{c['beta_boresight_deg']:+7.2f})"
+                                     if "alpha_boresight_deg" in c else "")
+                            print(f"  {name} id{tid:>3d} c{c['index']}  "
+                                  f"({c['alpha_deg']:+7.2f},{c['beta_deg']:+7.2f})°{extra}")
+
+                _print_angles("L", last_ang_left)
+                _print_angles("R", last_ang_right)
             elif key == ord("w"):
                 flush(args.out)
     finally:
