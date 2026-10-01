@@ -30,10 +30,12 @@ No monitor on the Jetson: add a stream and view it from the PC browser.
 """
 
 import argparse
+import io
 import json
 import queue
 import threading
 import time
+import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -276,8 +278,19 @@ _PAGE = b"""<!doctype html><title>AprilTag logger</title>
 <img src="/stream" style="max-width:100%;max-height:88vh"><br>
 <button onclick="c('s')">SNAP</button> <button onclick="c('a')">AUTO on/off</button>
 <button onclick="c('w')">WRITE</button>
+<button onclick="cap()" style="background:#2a7">CAPTURE (UYVY + JSON)</button> <span id="msg"></span>
 <style>button{font-size:20px;padding:8px 28px;margin:8px}</style>
-<script>function c(k){fetch('/cmd/'+k,{method:'POST'})}</script></body>"""
+<script>
+function c(k){fetch('/cmd/'+k,{method:'POST'})}
+async function cap(){
+  const r = await fetch('/capture',{method:'POST'});
+  if(!r.ok){document.getElementById('msg').textContent='capture failed';return;}
+  const n = r.headers.get('X-Filename');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(await r.blob()); a.download = n; a.click();
+  document.getElementById('msg').textContent = 'saved ' + n;
+}
+</script></body>"""
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -311,7 +324,19 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path.startswith("/cmd/") and self.path[5:] in ("s", "a", "w", "q"):
+        if self.path == "/capture":
+            res = capture_zip()
+            if res is None:
+                self.send_error(503, "no frame yet")
+                return
+            name, data = res
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("X-Filename", name + ".zip")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path.startswith("/cmd/") and self.path[5:] in ("s", "a", "w", "q"):
             web_cmds.put(self.path[5:])
             self.send_response(204)
             self.end_headers()
@@ -347,10 +372,8 @@ def snapshot(detections, frame_shape):
     return entry
 
 
-def flush(path):
-    if not log_frames:
-        print("[WRITE] nothing to flush")
-        return
+def _make_payloads(frames):
+    """(poses payload, angles payload) for a list of snapshot entries."""
     payload = {
         "intrinsic_source": args.intrinsic_json,
         "camera_matrix": K.tolist(),
@@ -360,16 +383,12 @@ def flush(path):
         "device": args.device,
         "pipeline": "v4l2src UYVY 1280x720@60 -> nvvidconv -> BGR",
         "space": "raw_pixels",
-        "num_frames_logged": len(log_frames),
-        "frames": log_frames,
+        "num_frames_logged": len(frames),
+        "frames": frames,
     }
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
 
-    # Second file: corner/centre angles from this camera's own principal
+    # Second payload: corner/centre angles from this camera's own principal
     # point (cx, cy), same convention as the C++ tracker (see _angles.py).
-    stem = path[:-5] if path.lower().endswith(".json") else path
-    angles_path = stem + "_angles.json"
     angles_payload = {
         "intrinsic_source": args.intrinsic_json,
         "device": args.device,
@@ -384,7 +403,7 @@ def flush(path):
         "K": K.tolist(),
         "tag_family": args.tag_family,
         "tag_size_mm": TAG_SIZE_MM,
-        "num_frames_logged": len(log_frames),
+        "num_frames_logged": len(frames),
         "frames": [{
             "frame_index": e["frame_index"],
             "timestamp_utc": e["timestamp_utc"],
@@ -393,12 +412,83 @@ def flush(path):
             "tags": [dict(id=t["id"],
                           **corner_angles_entry(np.asarray(t["corners_2d_raw"]), K))
                      for t in e["tags"]],
-        } for e in log_frames],
+        } for e in frames],
     }
+    return payload, angles_payload
+
+
+def flush(path):
+    if not log_frames:
+        print("[WRITE] nothing to flush")
+        return
+    payload, angles_payload = _make_payloads(log_frames)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    stem = path[:-5] if path.lower().endswith(".json") else path
+    angles_path = stem + "_angles.json"
     with open(angles_path, "w") as f:
         json.dump(angles_payload, f, indent=2)
     print(f"[WRITE] {len(log_frames)} frame(s) -> {path}  +  {angles_path}")
     log_frames.clear()
+
+
+# ============================================================
+# CAPTURE (web button): UYVY image + pose JSONs, zipped to the PC
+# ============================================================
+
+def bgr_to_uyvy(bgr):
+    """Packed UYVY (U Y0 V Y1, 2 bytes/pixel) from a BGR frame.
+    BT.601 limited range, chroma averaged over each horizontal pixel pair.
+    This is a conversion of the frame the poses were computed on, not the
+    sensor's raw bytes."""
+    f = bgr.astype(np.float32)
+    b, g, r = f[..., 0], f[..., 1], f[..., 2]
+    y = 16.0 + 0.257 * r + 0.504 * g + 0.098 * b
+    u = 128.0 - 0.148 * r - 0.291 * g + 0.439 * b
+    v = 128.0 + 0.439 * r - 0.368 * g - 0.071 * b
+    u = (u[:, 0::2] + u[:, 1::2]) / 2.0
+    v = (v[:, 0::2] + v[:, 1::2]) / 2.0
+    out = np.empty((bgr.shape[0], bgr.shape[1] * 2), dtype=np.uint8)
+    out[:, 0::4] = np.clip(u, 0, 255)
+    out[:, 1::4] = np.clip(y[:, 0::2], 0, 255)
+    out[:, 2::4] = np.clip(v, 0, 255)
+    out[:, 3::4] = np.clip(y[:, 1::2], 0, 255)
+    return out
+
+
+_capture_seq = 0
+_latest = {"frame": None, "dets": []}    # raw BGR frame + its detections, set by the main loop
+
+
+def capture_zip():
+    """Zip of <name>.uyvy + <name>_poses.json + <name>_angles.json for the
+    latest frame, or None if there is no frame yet. Returns (name, bytes)."""
+    global _capture_seq
+    with _stream_lock:
+        frame, dets = _latest["frame"], _latest["dets"]
+    if frame is None:
+        return None
+    _capture_seq += 1
+    name = f"capture_{_capture_seq:04d}"
+    entry = {
+        "frame_index": _capture_seq,
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",   # device clock: unreliable
+        "image_width": int(frame.shape[1]),
+        "image_height": int(frame.shape[0]),
+        "tags": dets,
+    }
+    payload, angles_payload = _make_payloads([entry])
+    h, w = frame.shape[:2]
+    payload["image_file"] = f"{name}.uyvy"
+    payload["image_format"] = (f"raw packed UYVY, {w}x{h}, {w * h * 2} bytes, "
+                               "converted from the BGR frame (BT.601 limited range)")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        z.writestr(f"{name}.uyvy", bgr_to_uyvy(frame).tobytes())
+        z.writestr(f"{name}_poses.json", json.dumps(payload, indent=2))
+        z.writestr(f"{name}_angles.json", json.dumps(angles_payload, indent=2))
+    print(f"[CAPTURE] {name}: {len(dets)} tag(s)")
+    return name, buf.getvalue()
 
 
 # ============================================================
@@ -486,6 +576,8 @@ def main():
             if args.stream_port > 0:
                 with _stream_lock:
                     _stream_frame = disp
+                    _latest["frame"] = frame        # raw frame (no overlays) + its detections
+                    _latest["dets"] = detections
 
             if auto and detections:
                 snapshot(detections, frame.shape)
