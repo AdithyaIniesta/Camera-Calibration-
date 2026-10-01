@@ -22,13 +22,20 @@ Keys:
 CLI:
   python3 apriltag_pose_logger.py intrinsics.json --tag-size 60
   python3 apriltag_pose_logger.py            # file-picker + tag-size prompt
+
+No monitor on the Jetson: add a stream and view it from the PC browser.
+  python3 apriltag_pose_logger.py intrinsics.json --tag-size 60 \\
+      --stream-port 8080 --headless
+  then open http://<jetson-ip>:8080  (SNAP / AUTO / WRITE buttons = S / A / W)
 """
 
 import argparse
 import json
+import queue
 import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import _opencv_cuda  # noqa: F401  (must import before cv2)
 import cv2
@@ -68,6 +75,11 @@ parser.add_argument("--device", default="/dev/video0",
                     help="V4L2 device path (default: /dev/video0)")
 parser.add_argument("--out", default="apriltag_pose_log.json",
                     help="Output JSON path")
+parser.add_argument("--stream-port", type=int, default=0,
+                    help="If >0, serve the annotated view as MJPEG on this port "
+                         "(open http://<jetson-ip>:PORT; page has Snap/Auto/Write buttons)")
+parser.add_argument("--headless", action="store_true",
+                    help="No local window / keyboard (use with --stream-port)")
 
 args = parse_or_pick(
     parser,
@@ -246,6 +258,68 @@ def draw_tag(img, corners_2d, tag_id, rvec, tvec):
 
 
 # ============================================================
+# STREAM (annotated view over HTTP, so no monitor is needed)
+# ============================================================
+
+_stream_frame = None             # latest annotated frame (BGR)
+_stream_lock = threading.Lock()
+web_cmds = queue.Queue()         # "s" / "a" / "w" / "q" from the web buttons
+
+_PAGE = b"""<!doctype html><title>AprilTag logger</title>
+<body style="margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center">
+<img src="/stream" style="max-width:100%;max-height:88vh"><br>
+<button onclick="c('s')">SNAP</button> <button onclick="c('a')">AUTO on/off</button>
+<button onclick="c('w')">WRITE</button>
+<style>button{font-size:20px;padding:8px 28px;margin:8px}</style>
+<script>function c(k){fetch('/cmd/'+k,{method:'POST'})}</script></body>"""
+
+
+class _Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(_PAGE)
+        elif self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            try:
+                while True:
+                    with _stream_lock:
+                        f = _stream_frame
+                    if f is None:
+                        time.sleep(0.05)
+                        continue
+                    ok, jpg = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                                     + jpg.tobytes() + b"\r\n")
+                    time.sleep(1 / 15)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path.startswith("/cmd/") and self.path[5:] in ("s", "a", "w", "q"):
+            web_cmds.put(self.path[5:])
+            self.send_response(204)
+            self.end_headers()
+        else:
+            self.send_error(404)
+
+
+def start_stream_server(port):
+    srv = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"[STREAM] http://<jetson-ip>:{port}")
+
+
+# ============================================================
 # LOG
 # ============================================================
 
@@ -330,15 +404,33 @@ def main():
     if not cam.start():
         return 1
 
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    global _stream_frame
+    if not args.headless:
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    if args.stream_port > 0:
+        start_stream_server(args.stream_port)
     auto = False
-    print("\nControls: S=snapshot, A=auto, W=write, Q/ESC=quit\n")
+    print("\nControls: S=snapshot, A=auto, W=write, Q/ESC=quit "
+          "(also the web buttons when --stream-port is set)\n")
+
+    def poll_key():
+        """Key from the local window or the web buttons, as a keycode (-1 = none)."""
+        k = -1 if args.headless else (cv2.waitKey(1) & 0xFF)
+        if k == 255:
+            k = -1
+        if k == -1:
+            try:
+                k = ord(web_cmds.get_nowait())
+            except queue.Empty:
+                if args.headless:
+                    time.sleep(0.001)
+        return k
 
     try:
         while True:
             frame = cam.get()
             if frame is None:
-                if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
+                if poll_key() in (ord("q"), 27):
                     break
                 continue
 
@@ -383,12 +475,16 @@ def main():
             put_text(disp, "S snap  A auto  W write  Q quit",
                      (20, disp.shape[0] - 20), scale=0.55, color=YELLOW)
 
-            cv2.imshow(WINDOW_NAME, disp)
+            if not args.headless:
+                cv2.imshow(WINDOW_NAME, disp)
+            if args.stream_port > 0:
+                with _stream_lock:
+                    _stream_frame = disp
 
             if auto and detections:
                 snapshot(detections, frame.shape)
 
-            key = cv2.waitKey(1) & 0xFF
+            key = poll_key()
             if key in (ord("q"), 27):
                 break
             elif key == ord("s"):
@@ -406,7 +502,8 @@ def main():
     finally:
         flush(args.out)   # write anything unsaved
         cam.stop()
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
     return 0
 
 
