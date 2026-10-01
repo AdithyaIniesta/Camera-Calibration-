@@ -304,10 +304,15 @@ def draw_tag(img, corners, tag_id, dist_mm, color, rvec=None, tvec=None,
              scale=0.5, color=CYAN)
     if rvec is not None and tvec is not None:
         proj, _ = cv2.projectPoints(AXES_3D, rvec, tvec, K, D)
-        o, xa, ya, za = proj.reshape(-1, 2).astype(int)
-        cv2.line(img, tuple(o), tuple(xa), (0, 0, 255), 2, cv2.LINE_AA)
-        cv2.line(img, tuple(o), tuple(ya), (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.line(img, tuple(o), tuple(za), (255, 0, 0), 2, cv2.LINE_AA)
+        proj = proj.reshape(-1, 2)
+        # Edge-on tags / strong distortion can project an axis end to NaN or a
+        # huge value that does not fit OpenCV's int32 pixels; skip the axes then.
+        if not np.all(np.isfinite(proj)) or np.abs(proj).max() > 1e5:
+            return
+        o, xa, ya, za = [(int(p[0]), int(p[1])) for p in proj]
+        cv2.line(img, o, xa, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.line(img, o, ya, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.line(img, o, za, (255, 0, 0), 2, cv2.LINE_AA)
 
 
 # ============================================================

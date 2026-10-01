@@ -245,16 +245,22 @@ def draw_tag(img, corners_2d, tag_id, rvec, tvec):
     center = pts.mean(axis=0).astype(int)
     put_text(img, f"id {tag_id}", (center[0] - 20, center[1] - 6),
              scale=0.65, color=YELLOW, thickness=2)
-    tz = float(tvec[2])
+    tz = float(tvec.ravel()[2])
     put_text(img, f"Z={tz/10:.1f} cm", (center[0] - 40, center[1] + 22),
              scale=0.5, color=CYAN, thickness=2)
 
     # Axes: red=X, green=Y, blue=Z (into the tag)
     proj, _ = cv2.projectPoints(AXES_3D, rvec, tvec, K, D)
-    o, x, y, z = proj.reshape(-1, 2).astype(int)
-    cv2.line(img, tuple(o), tuple(x), (0, 0, 255), 2, cv2.LINE_AA)
-    cv2.line(img, tuple(o), tuple(y), (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.line(img, tuple(o), tuple(z), (255, 0, 0), 2, cv2.LINE_AA)
+    proj = proj.reshape(-1, 2)
+    # Edge-on tags / strong distortion can project an axis end to NaN or a huge
+    # value; that does not fit OpenCV's int32 pixel type and used to crash the
+    # logger. Skip drawing the axes for such a tag.
+    if not np.all(np.isfinite(proj)) or np.abs(proj).max() > 1e5:
+        return
+    o, x, y, z = [(int(p[0]), int(p[1])) for p in proj]
+    cv2.line(img, o, x, (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.line(img, o, y, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.line(img, o, z, (255, 0, 0), 2, cv2.LINE_AA)
 
 
 # ============================================================
